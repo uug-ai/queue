@@ -7,11 +7,13 @@ import (
 
 // RabbitOptions holds the configuration for RabbitMQ
 type RabbitOptions struct {
-	Uri      string `validate:"required"`
-	Host     string `validate:"required"`
-	Username string `validate:"required"`
-	Password string `validate:"required"`
-	Exchange string
+	QueueName     string `validate:"required"`
+	Uri           string `validate:"required"`
+	Host          string `validate:"required"`
+	Username      string `validate:"required"`
+	Password      string `validate:"required"`
+	PrefetchCount int
+	Exchange      string
 }
 
 // RabbitOptionsBuilder provides a fluent interface for building Rabbit options
@@ -24,6 +26,12 @@ func NewRabbitOptions() *RabbitOptionsBuilder {
 	return &RabbitOptionsBuilder{
 		options: &RabbitOptions{},
 	}
+}
+
+// SetQueueName sets the queue name
+func (b *RabbitOptionsBuilder) SetQueueName(queueName string) *RabbitOptionsBuilder {
+	b.options.QueueName = queueName
+	return b
 }
 
 // SetUri sets the URI
@@ -70,7 +78,7 @@ type RabbitMQ struct {
 
 // NewRabbitMQ creates a new RabbitMQ with the provided RabbitMQ settings
 func NewRabbitMQ(options *RabbitOptions) (*RabbitMQ, error) {
-	// Validate Database configuration
+	// Validate RabbitMQ configuration
 	validate := validator.New()
 	err := validate.Struct(options)
 	if err != nil {
@@ -82,6 +90,7 @@ func NewRabbitMQ(options *RabbitOptions) (*RabbitMQ, error) {
 	connectionString := ""
 	hasProtocol := false
 	protocol := ""
+
 	if len(options.Host) > 7 {
 		if options.Host[:8] == "amqps://" {
 			hasProtocol = true

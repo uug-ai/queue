@@ -4,17 +4,6 @@ import (
 	"testing"
 )
 
-// MockQueueInterface is a mock implementation of Queue interface for testing
-type MockQueueInterface struct {
-	ConnectCalled bool
-	ConnectError  error
-}
-
-func (m *MockQueueInterface) Connect() error {
-	m.ConnectCalled = true
-	return m.ConnectError
-}
-
 // TestRabbitOptionsValidation tests the validation of RabbitMQ options
 func TestRabbitOptionsValidation(t *testing.T) {
 	tests := []struct {
@@ -26,6 +15,7 @@ func TestRabbitOptionsValidation(t *testing.T) {
 			name: "ValidOptionsComplete",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
+					SetQueueName("test-queue").
 					SetUri("amqp://user:pass@localhost:5672/").
 					SetHost("localhost:5672").
 					SetUsername("user").
@@ -39,6 +29,7 @@ func TestRabbitOptionsValidation(t *testing.T) {
 			name: "ValidOptionsMinimal",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
+					SetQueueName("test-queue").
 					SetUri("amqp://localhost").
 					SetHost("localhost").
 					SetUsername("guest").
@@ -49,9 +40,23 @@ func TestRabbitOptionsValidation(t *testing.T) {
 			expectError: false,
 		},
 		{
+			name: "MissingQueueName",
+			buildOpts: func() *RabbitOptions {
+				return NewRabbitOptions().
+					SetUri("amqp://localhost").
+					SetHost("localhost").
+					SetUsername("user").
+					SetPassword("pass").
+					SetExchange("my-exchange").
+					Build()
+			},
+			expectError: true,
+		},
+		{
 			name: "MissingUri",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
+					SetQueueName("test-queue").
 					SetHost("localhost").
 					SetUsername("user").
 					SetPassword("pass").
@@ -64,6 +69,7 @@ func TestRabbitOptionsValidation(t *testing.T) {
 			name: "MissingHost",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
+					SetQueueName("test-queue").
 					SetUri("amqp://localhost").
 					SetUsername("user").
 					SetPassword("pass").
@@ -76,6 +82,7 @@ func TestRabbitOptionsValidation(t *testing.T) {
 			name: "MissingUsername",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
+					SetQueueName("test-queue").
 					SetUri("amqp://localhost").
 					SetHost("localhost").
 					SetPassword("pass").
@@ -88,6 +95,7 @@ func TestRabbitOptionsValidation(t *testing.T) {
 			name: "MissingPassword",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
+					SetQueueName("test-queue").
 					SetUri("amqp://localhost").
 					SetHost("localhost").
 					SetUsername("user").
@@ -107,6 +115,7 @@ func TestRabbitOptionsValidation(t *testing.T) {
 			name: "ValidOptionsWithAmqps",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
+					SetQueueName("secure-queue").
 					SetUri("amqps://user:pass@localhost:5671/").
 					SetHost("amqps://localhost:5671").
 					SetUsername("user").
@@ -138,6 +147,7 @@ func TestRabbitOptionsValidation(t *testing.T) {
 func TestRabbitOptionsBuilder(t *testing.T) {
 	t.Run("BuilderSettersChaining", func(t *testing.T) {
 		opts := NewRabbitOptions().
+			SetQueueName("test-queue").
 			SetUri("amqp://testuser:testpass@localhost:5672/testvhost").
 			SetHost("localhost:5672").
 			SetUsername("testuser").
@@ -145,6 +155,9 @@ func TestRabbitOptionsBuilder(t *testing.T) {
 			SetExchange("test-exchange").
 			Build()
 
+		if opts.QueueName != "test-queue" {
+			t.Errorf("expected QueueName to be 'test-queue', got '%s'", opts.QueueName)
+		}
 		if opts.Uri != "amqp://testuser:testpass@localhost:5672/testvhost" {
 			t.Errorf("expected Uri to be 'amqp://testuser:testpass@localhost:5672/testvhost', got '%s'", opts.Uri)
 		}
@@ -168,6 +181,9 @@ func TestRabbitOptionsBuilder(t *testing.T) {
 			SetHost("localhost").
 			Build()
 
+		if opts.QueueName != "" {
+			t.Errorf("expected QueueName to be empty by default, got '%s'", opts.QueueName)
+		}
 		if opts.Uri != "amqp://localhost" {
 			t.Errorf("expected Uri to be set, got '%s'", opts.Uri)
 		}
@@ -188,6 +204,9 @@ func TestRabbitOptionsBuilder(t *testing.T) {
 	t.Run("EmptyBuilder", func(t *testing.T) {
 		opts := NewRabbitOptions().Build()
 
+		if opts.QueueName != "" {
+			t.Errorf("expected QueueName to be empty, got '%s'", opts.QueueName)
+		}
 		if opts.Uri != "" {
 			t.Errorf("expected Uri to be empty, got '%s'", opts.Uri)
 		}
@@ -217,6 +236,7 @@ func TestRabbitConnectionStringGeneration(t *testing.T) {
 			name: "BasicAmqpProtocol",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
+					SetQueueName("test-queue").
 					SetUri("amqp://localhost").
 					SetHost("localhost:5672").
 					SetUsername("user").
@@ -230,6 +250,7 @@ func TestRabbitConnectionStringGeneration(t *testing.T) {
 			name: "AmqpsProtocol",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
+					SetQueueName("test-queue").
 					SetUri("amqps://localhost").
 					SetHost("amqps://localhost:5671").
 					SetUsername("user").
@@ -243,6 +264,7 @@ func TestRabbitConnectionStringGeneration(t *testing.T) {
 			name: "AmqpProtocol",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
+					SetQueueName("test-queue").
 					SetUri("amqp://localhost").
 					SetHost("amqp://localhost:5672").
 					SetUsername("user").
@@ -256,6 +278,7 @@ func TestRabbitConnectionStringGeneration(t *testing.T) {
 			name: "NoProtocolInHost",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
+					SetQueueName("test-queue").
 					SetUri("amqp://localhost").
 					SetHost("localhost:5672").
 					SetUsername("guest").
