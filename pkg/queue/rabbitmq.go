@@ -1,6 +1,9 @@
 package queue
 
 import (
+	"strings"
+	"time"
+
 	"github.com/go-playground/validator/v10"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -80,6 +83,8 @@ type RabbitMQ struct {
 	options          *RabbitOptions
 	connectionString string
 	Connection       *amqp.Connection
+	Consumer         *amqp.Channel
+	Producer         *amqp.Channel
 }
 
 // NewRabbitMQ creates a new RabbitMQ with the provided RabbitMQ settings
@@ -91,31 +96,17 @@ func NewRabbitMQ(options *RabbitOptions) (*RabbitMQ, error) {
 		return nil, err
 	}
 
-	// @ TODO we will need to rework this, as it's not optimal and dirty coding style.
-	// Check if host containers aqmps:// or amqp://
-	connectionString := ""
-	hasProtocol := false
-	protocol := ""
-
-	if len(options.Host) > 7 {
-		if options.Host[:8] == "amqps://" {
-			hasProtocol = true
-			protocol = "amqps://"
-			options.Host = options.Host[8:]
-		} else if options.Host[:7] == "amqp://" {
-			hasProtocol = true
-			protocol = "amqp://"
-			options.Host = options.Host[7:]
-		}
+	// Extract protocol from host if present, otherwise default to amqp://
+	protocol := "amqp://"
+	host := options.Host
+	if strings.HasPrefix(host, "amqps://") {
+		protocol = "amqps://"
+		host = strings.TrimPrefix(host, "amqps://")
+	} else if strings.HasPrefix(host, "amqp://") {
+		host = strings.TrimPrefix(host, "amqp://")
 	}
 
-	if options.Host != "" && options.Username != "" && options.Password != "" {
-		if hasProtocol {
-			connectionString = protocol + options.Username + ":" + options.Password + "@" + options.Host + "/"
-		} else {
-			connectionString = "amqp://" + options.Username + ":" + options.Password + "@" + options.Host + "/"
-		}
-	}
+	connectionString := protocol + options.Username + ":" + options.Password + "@" + host + "/"
 
 	return &RabbitMQ{
 		options:          options,
@@ -124,5 +115,63 @@ func NewRabbitMQ(options *RabbitOptions) (*RabbitMQ, error) {
 }
 
 func (r *RabbitMQ) Connect() error {
+
+	prefetchCount := 5
+	if r.options.PrefetchCount > 0 {
+		prefetchCount = r.options.PrefetchCount
+	}
+
+	// Establish connection, with tweaked
+	connection, err := amqp.DialConfig(r.connectionString, amqp.Config{
+		Heartbeat:       time.Duration(10) * time.Second, // Set the default heartbeat interval
+		TLSClientConfig: nil,                             // No TLS configuration
+	})
+	if err != nil {
+		return err
+	}
+	r.Connection = connection
+
+	// Create channel for producing, publishing messages.
+	r.Producer, err = r.Connection.Channel()
+	if err != nil {
+		return err
+	}
+
+	// Create channel for consuming, receiving messages.
+	r.Consumer, err = r.Connection.Channel()
+	if err != nil {
+		return err
+	}
+	// prefetch count - max unacked messages per consumer
+	err = r.Consumer.Qos(prefetchCount, 0, false)
+	if err != nil {
+		return err
+	}
+
+	// Declare the queue
+	err = r.declareQueue()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// declareQueue declares a quorum queue with the configured queue name
+func (r *RabbitMQ) declareQueue() error {
+	// Declare quorum queue (idempotent - succeeds if queue exists with same parameters)
+	_, err := r.Consumer.QueueDeclare(
+		r.options.QueueName, // name
+		true,                // durable
+		false,               // delete when unused
+		false,               // exclusive
+		false,               // no-wait
+		amqp.Table{
+			"x-queue-type": "quorum",
+		}, // arguments
+	)
+	if err != nil {
+		return err
+	}
 	return nil
 }
