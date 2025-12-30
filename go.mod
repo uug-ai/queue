@@ -1,3 +1,3 @@
-module github.com/uug-ai/templates-go
+module github.com/uug-ai/queue
 
-go 1.24.9
+go 1.24.10

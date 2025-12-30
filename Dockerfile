@@ -43,7 +43,7 @@ RUN cp -r /${project} ./
 # Final Stage: Create the small runtime image.
 
 FROM alpine:latest
-LABEL org.opencontainers.image.source https://github.com/uug-ai/templates-go
+LABEL org.opencontainers.image.source https://github.com/uug-ai/queue
 LABEL AUTHOR=uug-ai
 
 ARG project
