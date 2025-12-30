@@ -50,6 +50,12 @@ func (b *RabbitOptionsBuilder) SetPassword(password string) *RabbitOptionsBuilde
 	return b
 }
 
+// SetExchange sets the exchange
+func (b *RabbitOptionsBuilder) SetExchange(exchange string) *RabbitOptionsBuilder {
+	b.options.Exchange = exchange
+	return b
+}
+
 // Build builds the Rabbit options
 func (b *RabbitOptionsBuilder) Build() *RabbitOptions {
 	return b.options
