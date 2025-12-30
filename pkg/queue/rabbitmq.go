@@ -81,10 +81,10 @@ func (b *RabbitOptionsBuilder) Build() *RabbitOptions {
 // RabbitMQ wraps rabbitmq.Client to implement the Queue interface
 type RabbitMQ struct {
 	options          *RabbitOptions
-	connectionString string
-	Connection       *amqp.Connection
-	Consumer         *amqp.Channel
-	Producer         *amqp.Channel
+	connectionString string           // e.g., amqp://user:pass@host:port/
+	Connection       *amqp.Connection // The underlying RabbitMQ connection
+	Consumer         *amqp.Channel    // Channel for consuming messages
+	Producer         *amqp.Channel    // Channel for producing messages
 }
 
 // NewRabbitMQ creates a new RabbitMQ with the provided RabbitMQ settings
