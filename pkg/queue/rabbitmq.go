@@ -11,7 +11,7 @@ import (
 // RabbitOptions holds the configuration for RabbitMQ
 type RabbitOptions struct {
 	QueueName     string `validate:"required"`
-	Uri           string `validate:"required"`
+	Uri           string
 	Host          string `validate:"required"`
 	Username      string `validate:"required"`
 	Password      string `validate:"required"`
@@ -95,7 +95,6 @@ func NewRabbitMQ(options *RabbitOptions) (*RabbitMQ, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	// Extract protocol from host if present, otherwise default to amqp://
 	protocol := "amqp://"
 	host := options.Host
@@ -105,12 +104,10 @@ func NewRabbitMQ(options *RabbitOptions) (*RabbitMQ, error) {
 	} else if strings.HasPrefix(host, "amqp://") {
 		host = strings.TrimPrefix(host, "amqp://")
 	}
-
-	connectionString := protocol + options.Username + ":" + options.Password + "@" + host + "/"
-
+	// Build connection string
 	return &RabbitMQ{
 		options:          options,
-		connectionString: connectionString,
+		connectionString: protocol + options.Username + ":" + options.Password + "@" + host + "/",
 	}, nil
 }
 

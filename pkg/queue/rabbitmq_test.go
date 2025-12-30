@@ -1,7 +1,9 @@
 package queue
 
 import (
+	"os"
 	"testing"
+	"time"
 )
 
 // TestRabbitOptionsValidation tests the validation of RabbitMQ options
@@ -44,19 +46,6 @@ func TestRabbitOptionsValidation(t *testing.T) {
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
 					SetUri("amqp://localhost").
-					SetHost("localhost").
-					SetUsername("user").
-					SetPassword("pass").
-					SetExchange("my-exchange").
-					Build()
-			},
-			expectError: true,
-		},
-		{
-			name: "MissingUri",
-			buildOpts: func() *RabbitOptions {
-				return NewRabbitOptions().
-					SetQueueName("test-queue").
 					SetHost("localhost").
 					SetUsername("user").
 					SetPassword("pass").
@@ -304,4 +293,145 @@ func TestRabbitConnectionStringGeneration(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRabbitMQIntegration(t *testing.T) {
+
+	// Read environment variables
+	uri := os.Getenv("RABBITMQ_URI")
+	host := os.Getenv("RABBITMQ_HOST")
+	username := os.Getenv("RABBITMQ_USERNAME")
+	password := os.Getenv("RABBITMQ_PASSWORD")
+	queueName := os.Getenv("RABBITMQ_QUEUE_NAME")
+	exchange := os.Getenv("RABBITMQ_EXCHANGE")
+
+	// Set defaults for optional values
+	if queueName == "" {
+		queueName = "test-integration-queue"
+	}
+
+	t.Run("ConnectToRealRabbitMQ", func(t *testing.T) {
+		// Build RabbitMQ options from environment variables
+		opts := NewRabbitOptions().
+			SetQueueName(queueName).
+			SetUri(uri).
+			SetHost(host).
+			SetUsername(username).
+			SetPassword(password).
+			SetExchange(exchange).
+			SetPrefetchCount(5).
+			Build()
+
+		// Create RabbitMQ instance
+		rabbit, err := NewRabbitMQ(opts)
+		if err != nil {
+			t.Fatalf("Failed to create RabbitMQ instance: %v", err)
+		}
+
+		// Test connection
+		err = rabbit.Connect()
+		if err != nil {
+			t.Fatalf("Failed to connect to RabbitMQ: %v", err)
+		}
+		defer func() {
+			if rabbit.Connection != nil && !rabbit.Connection.IsClosed() {
+				rabbit.Connection.Close()
+			}
+		}()
+
+		// Verify connection is established
+		if rabbit.Connection == nil {
+			t.Fatal("Connection is nil after Connect()")
+		}
+		if rabbit.Connection.IsClosed() {
+			t.Fatal("Connection is closed after Connect()")
+		}
+
+		// Verify channels are created
+		if rabbit.Producer == nil {
+			t.Fatal("Producer channel is nil after Connect()")
+		}
+		if rabbit.Consumer == nil {
+			t.Fatal("Consumer channel is nil after Connect()")
+		}
+
+		t.Logf("Successfully connected to RabbitMQ at %s", host)
+		t.Logf("Queue: %s", queueName)
+		t.Logf("Exchange: %s", exchange)
+	})
+
+	t.Run("ConnectionHealthCheck", func(t *testing.T) {
+		opts := NewRabbitOptions().
+			SetQueueName(queueName).
+			SetUri(uri).
+			SetHost(host).
+			SetUsername(username).
+			SetPassword(password).
+			SetExchange(exchange).
+			Build()
+
+		rabbit, err := NewRabbitMQ(opts)
+		if err != nil {
+			t.Fatalf("Failed to create RabbitMQ instance: %v", err)
+		}
+
+		err = rabbit.Connect()
+		if err != nil {
+			t.Fatalf("Failed to connect to RabbitMQ: %v", err)
+		}
+		defer func() {
+			if rabbit.Connection != nil && !rabbit.Connection.IsClosed() {
+				rabbit.Connection.Close()
+			}
+		}()
+
+		// Wait a moment to ensure connection stability
+		time.Sleep(100 * time.Millisecond)
+
+		// Check that connection remains stable
+		if rabbit.Connection.IsClosed() {
+			t.Fatal("Connection closed unexpectedly after initial connection")
+		}
+
+		t.Log("Connection health check passed")
+	})
+
+	t.Run("MultipleConnections", func(t *testing.T) {
+		opts := NewRabbitOptions().
+			SetQueueName(queueName).
+			SetUri(uri).
+			SetHost(host).
+			SetUsername(username).
+			SetPassword(password).
+			SetExchange(exchange).
+			Build()
+
+		// Create multiple connections
+		connections := make([]*RabbitMQ, 3)
+		for i := 0; i < 3; i++ {
+			rabbit, err := NewRabbitMQ(opts)
+			if err != nil {
+				t.Fatalf("Failed to create RabbitMQ instance %d: %v", i, err)
+			}
+
+			err = rabbit.Connect()
+			if err != nil {
+				t.Fatalf("Failed to connect RabbitMQ instance %d: %v", i, err)
+			}
+
+			connections[i] = rabbit
+		}
+
+		// Close all connections
+		for i, rabbit := range connections {
+			if rabbit.Connection != nil && !rabbit.Connection.IsClosed() {
+				err := rabbit.Connection.Close()
+				if err != nil {
+					t.Errorf("Failed to close connection %d: %v", i, err)
+				}
+			}
+		}
+
+		t.Log("Successfully created and closed multiple connections")
+	})
 }
