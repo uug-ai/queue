@@ -97,18 +97,6 @@ func TestRabbitOptionsValidation(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name: "MissingExchange",
-			buildOpts: func() *RabbitOptions {
-				return NewRabbitOptions().
-					SetUri("amqp://localhost").
-					SetHost("localhost").
-					SetUsername("user").
-					SetPassword("pass").
-					Build()
-			},
-			expectError: true,
-		},
-		{
 			name: "EmptyOptions",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().Build()
@@ -221,9 +209,9 @@ func TestRabbitOptionsBuilder(t *testing.T) {
 // TestRabbitConnectionStringGeneration tests the connection string generation logic
 func TestRabbitConnectionStringGeneration(t *testing.T) {
 	tests := []struct {
-		name             string
-		buildOpts        func() *RabbitOptions
-		expectedConnStr  string
+		name            string
+		buildOpts       func() *RabbitOptions
+		expectedConnStr string
 	}{
 		{
 			name: "BasicAmqpProtocol",

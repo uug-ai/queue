@@ -11,7 +11,7 @@ type RabbitOptions struct {
 	Host     string `validate:"required"`
 	Username string `validate:"required"`
 	Password string `validate:"required"`
-	Exchange string `validate:"required"`
+	Exchange string
 }
 
 // RabbitOptionsBuilder provides a fluent interface for building Rabbit options
