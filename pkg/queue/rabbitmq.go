@@ -64,6 +64,12 @@ func (b *RabbitOptionsBuilder) SetExchange(exchange string) *RabbitOptionsBuilde
 	return b
 }
 
+// SetPrefetchCount sets the prefetch count
+func (b *RabbitOptionsBuilder) SetPrefetchCount(count int) *RabbitOptionsBuilder {
+	b.options.PrefetchCount = count
+	return b
+}
+
 // Build builds the Rabbit options
 func (b *RabbitOptionsBuilder) Build() *RabbitOptions {
 	return b.options
