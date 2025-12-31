@@ -15,6 +15,12 @@ jobs:
 
   build:
     runs-on: ${{ matrix.runner }}
+    env:
+      RABBITMQ_URI: ${{ secrets.RABBITMQ_URI }}
+      RABBITMQ_HOST: ${{ secrets.RABBITMQ_HOST }}
+      RABBITMQ_USERNAME: ${{ secrets.RABBITMQ_USERNAME }}
+      RABBITMQ_PASSWORD: ${{ secrets.RABBITMQ_PASSWORD }}
+      RABBITMQ_EXCHANGE: ${{ secrets.RABBITMQ_EXCHANGE }}
     permissions:
       contents: write
       packages: write

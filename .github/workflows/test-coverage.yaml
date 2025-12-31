@@ -19,6 +19,12 @@ env:
 jobs:
   test-coverage:
     runs-on: ubuntu-latest
+    env:
+      RABBITMQ_URI: ${{ secrets.RABBITMQ_URI }}
+      RABBITMQ_HOST: ${{ secrets.RABBITMQ_HOST }}
+      RABBITMQ_USERNAME: ${{ secrets.RABBITMQ_USERNAME }}
+      RABBITMQ_PASSWORD: ${{ secrets.RABBITMQ_PASSWORD }}
+      RABBITMQ_EXCHANGE: ${{ secrets.RABBITMQ_EXCHANGE }}
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - name: Checkout repository

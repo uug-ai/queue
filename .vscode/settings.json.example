@@ -1,4 +1,11 @@
 {
+    "go.testEnvVars": {
+        "RABBITMQ_URI": "",
+        "RABBITMQ_HOST": "",
+        "RABBITMQ_USERNAME": "",
+        "RABBITMQ_PASSWORD": "",
+        "RABBITMQ_EXCHANGE": ""
+    },
     "mdb.presetConnections": [
         {
             "name": "MongoDB Atlas Production",
