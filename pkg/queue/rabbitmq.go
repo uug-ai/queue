@@ -111,6 +111,7 @@ func NewRabbitMQ(options *RabbitOptions) (*RabbitMQ, error) {
 	}, nil
 }
 
+// Connect establishes the RabbitMQ connection and channels
 func (r *RabbitMQ) Connect() error {
 
 	prefetchCount := 5
@@ -151,6 +152,16 @@ func (r *RabbitMQ) Connect() error {
 		return err
 	}
 
+	return nil
+}
+
+// Reconnect attempts to re-establish the RabbitMQ connection
+// Basic implementation just calls Connect again
+func (r *RabbitMQ) Reconnect() error {
+	err := r.Connect()
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
