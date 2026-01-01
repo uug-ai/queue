@@ -488,3 +488,50 @@ func TestRabbitMQIntegration(t *testing.T) {
 		t.Log("Successfully created and closed multiple connections")
 	})
 }
+
+// TestFormatQueueName tests the formatQueueName function that applies legacy naming convention
+func TestFormatQueueName(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "Simple queue name",
+			input:    "test",
+			expected: "kcloud-test-queue",
+		},
+		{
+			name:     "Queue name with dashes",
+			input:    "test-service",
+			expected: "kcloud-test-service-queue",
+		},
+		{
+			name:     "Empty string",
+			input:    "",
+			expected: "kcloud--queue",
+		},
+		{
+			name:     "Queue name with underscores",
+			input:    "test_service",
+			expected: "kcloud-test_service-queue",
+		},
+		{
+			name:     "Queue name with numbers",
+			input:    "test123",
+			expected: "kcloud-test123-queue",
+		},
+	}
+
+	// Create a minimal RabbitMQ instance for testing
+	rabbit := &RabbitMQ{}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := rabbit.formatQueueName(tt.input)
+			if result != tt.expected {
+				t.Errorf("formatQueueName(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}

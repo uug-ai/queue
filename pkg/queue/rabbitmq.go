@@ -373,6 +373,7 @@ func (r *RabbitMQ) RouteMessages(handleMessage MessageHandler, handlePrometheus 
 
 		if len(pipelineEvent.Stages) > 0 {
 			nextQueue := pipelineEvent.Stages[0]
+			nextQueue = r.formatQueueName(nextQueue) // Apply legacy naming convention, we will remove this later
 			err = r.Publish(nextQueue, payload)
 			if err != nil {
 				r.AddToDeadletter(payload)
@@ -409,6 +410,12 @@ func (r *RabbitMQ) Close() {
 	if r.Connection != nil {
 		r.Connection.Close()
 	}
+}
+
+// formatQueueName applies legacy naming convention to queue names
+// TODO: Remove this once legacy naming convention is deprecated
+func (r *RabbitMQ) formatQueueName(queueName string) string {
+	return "kcloud-" + queueName + "-queue"
 }
 
 // Publish sends a message immediately to the specified RabbitMQ queue
