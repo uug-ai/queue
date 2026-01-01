@@ -225,13 +225,15 @@ const (
 type MessageHandler func(models.PipelineEvent, ...any) (PipelineAction, models.PipelineEvent, int)
 type PrometheusHandler func(PipelineMetrics)
 
-// ReadMessagesForever reads messages from the RabbitMQ queue indefinitely
+// ReadMessages reads messages from the RabbitMQ queue, processes them using the provided handler,
+// and reports metrics using the provided Prometheus handler. It will then take action based on the handler's result.
+// Forwards, cancels, retries or sends to deadletter as needed.
+//
 // Parameters:
 // - handleMessage: function to process each message
 // - handlePrometheus: function to handle metrics reporting
 // - args: additional arguments to pass to the message handler
-
-func (r *RabbitMQ) ReadMessagesForever(handleMessage MessageHandler, handlePrometheus PrometheusHandler, args ...any) error {
+func (r *RabbitMQ) ReadMessages(handleMessage MessageHandler, handlePrometheus PrometheusHandler, args ...any) error {
 
 	// Subscribe to a queue
 	if r.Consumer == nil {
@@ -263,7 +265,7 @@ func (r *RabbitMQ) ReadMessagesForever(handleMessage MessageHandler, handleProme
 		var pipelineEvent models.PipelineEvent
 		err = json.Unmarshal(payload, &pipelineEvent)
 		if err != nil {
-
+			r.AddToDeadletter(payload)
 			return err
 		}
 
@@ -288,7 +290,11 @@ func (r *RabbitMQ) ReadMessagesForever(handleMessage MessageHandler, handleProme
 				return err
 			}
 			topic := r.options.RouterQueue
-			r.Publish(topic, pipelineEventPayload, 0)
+			err = r.Publish(topic, pipelineEventPayload)
+			if err != nil {
+				r.AddToDeadletter(payload)
+				return err
+			}
 		case Error:
 			// Send to deadletter queue
 			pipelineEventPayload, err := json.Marshal(pipelineEvent)
@@ -297,12 +303,81 @@ func (r *RabbitMQ) ReadMessagesForever(handleMessage MessageHandler, handleProme
 				return err
 			}
 			topic := r.options.DeadletterQueue
-			r.Publish(topic, pipelineEventPayload, 0)
+			err = r.Publish(topic, pipelineEventPayload)
+			if err != nil {
+				r.AddToDeadletter(payload)
+				return err
+			}
 		case Cancel:
 			// Nothing to do, just acknowledge, message will be removed from the queue.
 		case Retry:
-			// Republish the same message to the router queue for retry
-			// @TODO: consider adding a retry counter to avoid infinite retries
+			// Re-publish the same message to the same queue for retry
+			backoff := 5
+			r.PublishWithDelay(r.options.ConsumerQueue, payload, backoff)
+		}
+
+		// Always acknowledge messages regardless of sync mode
+		err = d.Ack(false)
+		if err != nil {
+			r.AddToDeadletter(payload)
+			return err
+		}
+
+		// Chrono end
+		endTime := time.Now()
+		processingTime := endTime.Sub(startTime)
+		e := PipelineMetrics{
+			ProcessingTime: processingTime.Seconds(),
+		}
+		handlePrometheus(e)
+	}
+	r.Close()
+	return nil
+}
+
+func (r *RabbitMQ) RouteMessages(handleMessage MessageHandler, handlePrometheus PrometheusHandler, args ...any) error {
+
+	// Subscribe to a queue
+	if r.Consumer == nil {
+		return fmt.Errorf("RabbitMQ channel is not initialized")
+	}
+
+	msgs, err := r.Consumer.Consume(
+		r.options.ConsumerQueue, // queue
+		"",                      // consumer
+		false,                   // auto-ack
+		false,                   // exclusive
+		false,                   // no-local
+		false,                   // no-wait
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+
+	for d := range msgs {
+
+		// Chrono start, we will measure processing time (start to end)
+		startTime := time.Now()
+
+		// Extract message
+		payload := d.Body
+
+		// Unmarshal message body into PipelineEvent
+		var pipelineEvent models.PipelineEvent
+		err = json.Unmarshal(payload, &pipelineEvent)
+		if err != nil {
+			r.AddToDeadletter(payload)
+			return err
+		}
+
+		if len(pipelineEvent.Stages) > 0 {
+			nextQueue := pipelineEvent.Stages[0]
+			err = r.Publish(nextQueue, payload)
+			if err != nil {
+				r.AddToDeadletter(payload)
+				return err
+			}
 		}
 
 		// Always acknowledge messages regardless of sync mode
@@ -336,17 +411,16 @@ func (r *RabbitMQ) Close() {
 	}
 }
 
-// Publish sends a message to the specified RabbitMQ queue
-func (r *RabbitMQ) Publish(queueName string, payload []byte, delaySeconds int) error {
+// Publish sends a message immediately to the specified RabbitMQ queue
+func (r *RabbitMQ) Publish(queueName string, payload []byte) error {
 	if r.Producer == nil {
+		r.DisasterRecovery(payload)
 		return fmt.Errorf("RabbitMQ producer channel is not initialized")
 	}
 
-	// Publish message to the queue
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Publish message to the specified queue
 	err := r.Producer.PublishWithContext(ctx,
 		"",        // exchange
 		queueName, // routing key (queue name)
@@ -357,13 +431,49 @@ func (r *RabbitMQ) Publish(queueName string, payload []byte, delaySeconds int) e
 			Body:        payload,
 		},
 	)
+	if err != nil {
+		r.DisasterRecovery(payload)
+	}
 	return err
+}
+
+// PublishWithDelay sends a message to the specified RabbitMQ queue after a delay
+// This is non-blocking and runs in a goroutine. Errors are not returned to the caller.
+// For production use, consider adding logging or an error channel.
+func (r *RabbitMQ) PublishWithDelay(queueName string, payload []byte, backoff int) {
+	go func() {
+		time.Sleep(time.Duration(backoff) * time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		// Note: errors from delayed publishes are not returned to caller
+		// Consider adding logging or error channel if needed
+		err := r.Producer.PublishWithContext(ctx,
+			"",        // exchange
+			queueName, // routing key (queue name)
+			false,     // mandatory
+			false,     // immediate
+			amqp.Publishing{
+				ContentType: "application/json",
+				Body:        payload,
+			},
+		)
+		if err != nil {
+			r.DisasterRecovery(payload)
+		}
+	}()
 }
 
 // AddToDeadletter adds a message to the deadletter queue
 func (r RabbitMQ) AddToDeadletter(payload []byte) error {
 	topic := r.options.DeadletterQueue
-	return r.Publish(topic, payload, 0)
+	return r.Publish(topic, payload)
+}
+
+func (r RabbitMQ) DisasterRecovery(payload []byte) error {
+	// We should persist the message on disk or take other actions
+	// @TODO: implement persistent storage or logging
+	return nil
 }
 
 func (r RabbitMQ) LoadMessages(filename string) error {
