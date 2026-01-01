@@ -1,22 +1,28 @@
 package queue
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/go-playground/validator/v10"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/uug-ai/models/pkg/models"
 )
 
 // RabbitOptions holds the configuration for RabbitMQ
 type RabbitOptions struct {
-	QueueName     string `validate:"required"`
-	Uri           string
-	Host          string `validate:"required"`
-	Username      string `validate:"required"`
-	Password      string `validate:"required"`
-	PrefetchCount int
-	Exchange      string
+	ConsumerQueue   string `validate:"required"` // Queue from which to consume messages, one consumer per queue
+	DeadletterQueue string `validate:"required"` // When something goes wrong, messages are sent here
+	RouterQueue     string `validate:"required"` // Router queue for routing messages, the message will be send to this queue if Forward action reached.
+	Uri             string
+	Host            string `validate:"required"`
+	Username        string `validate:"required"`
+	Password        string `validate:"required"`
+	PrefetchCount   int
+	Exchange        string
 }
 
 // RabbitOptionsBuilder provides a fluent interface for building Rabbit options
@@ -31,9 +37,21 @@ func NewRabbitOptions() *RabbitOptionsBuilder {
 	}
 }
 
-// SetQueueName sets the queue name
-func (b *RabbitOptionsBuilder) SetQueueName(queueName string) *RabbitOptionsBuilder {
-	b.options.QueueName = queueName
+// SetConsumerQueue sets the consumer queue name
+func (b *RabbitOptionsBuilder) SetConsumerQueue(queueName string) *RabbitOptionsBuilder {
+	b.options.ConsumerQueue = queueName
+	return b
+}
+
+// SetDeadletterQueue sets the deadletter queue name
+func (b *RabbitOptionsBuilder) SetDeadletterQueue(queueName string) *RabbitOptionsBuilder {
+	b.options.DeadletterQueue = queueName
+	return b
+}
+
+// SetRouterQueue sets the router queue name
+func (b *RabbitOptionsBuilder) SetRouterQueue(queueName string) *RabbitOptionsBuilder {
+	b.options.RouterQueue = queueName
 	return b
 }
 
@@ -169,11 +187,11 @@ func (r *RabbitMQ) Reconnect() error {
 func (r *RabbitMQ) declareQueue() error {
 	// Declare quorum queue (idempotent - succeeds if queue exists with same parameters)
 	_, err := r.Consumer.QueueDeclare(
-		r.options.QueueName, // name
-		true,                // durable
-		false,               // delete when unused
-		false,               // exclusive
-		false,               // no-wait
+		r.options.ConsumerQueue, // name
+		true,                    // durable
+		false,                   // delete when unused
+		false,                   // exclusive
+		false,                   // no-wait
 		amqp.Table{
 			"x-queue-type": "quorum",
 		}, // arguments
@@ -181,5 +199,174 @@ func (r *RabbitMQ) declareQueue() error {
 	if err != nil {
 		return err
 	}
+	return nil
+}
+
+// PipelineMetrics represents processing metrics for a pipeline event
+type PipelineMetrics struct {
+	ProcessingTime float64 `json:"processingTime,omitempty"`
+}
+
+// HandlerResult represents the result of message handling
+type PipelineAction string
+
+const (
+	// Forward indicates the message should be forwarded to the next stage
+	Forward PipelineAction = "forward"
+	// Cancel indicates the message processing should be cancelled
+	Cancel PipelineAction = "cancel"
+	// Retry indicates the message should be retried
+	Retry PipelineAction = "retry"
+	// Error indicates an error occurred during message processing
+	Error PipelineAction = "error"
+)
+
+// MessageHandler is a function type for handling pipeline events
+type MessageHandler func(models.PipelineEvent, ...any) (PipelineAction, models.PipelineEvent, int)
+type PrometheusHandler func(PipelineMetrics)
+
+// ReadMessagesForever reads messages from the RabbitMQ queue indefinitely
+// Parameters:
+// - handleMessage: function to process each message
+// - handlePrometheus: function to handle metrics reporting
+// - args: additional arguments to pass to the message handler
+
+func (r *RabbitMQ) ReadMessagesForever(handleMessage MessageHandler, handlePrometheus PrometheusHandler, args ...any) error {
+
+	// Subscribe to a queue
+	if r.Consumer == nil {
+		return fmt.Errorf("RabbitMQ channel is not initialized")
+	}
+
+	msgs, err := r.Consumer.Consume(
+		r.options.ConsumerQueue, // queue
+		"",                      // consumer
+		false,                   // auto-ack
+		false,                   // exclusive
+		false,                   // no-local
+		false,                   // no-wait
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+
+	for d := range msgs {
+
+		// Chrono start, we will measure processing time (start to end)
+		startTime := time.Now()
+
+		// Extract message
+		payload := d.Body
+
+		// Unmarshal message body into PipelineEvent
+		var pipelineEvent models.PipelineEvent
+		err = json.Unmarshal(payload, &pipelineEvent)
+		if err != nil {
+
+			return err
+		}
+
+		// We will override payload with the new payload
+		// some consumers might provide additional information, that can be leveraged
+		// later (stateful messaging).
+		pipelineAction, pipelineEvent, _ := handleMessage(pipelineEvent, args...)
+
+		// Depending on action, we either forward, cancel or retry
+		switch pipelineAction {
+		case Forward:
+			// Bring event to the next stage
+			pipelineEvent.Stages = pipelineEvent.Stages[1:]
+			if len(pipelineEvent.Stages) == 0 {
+				// No more stages, nothing to do
+				break
+			}
+			// Marshal updated event
+			pipelineEventPayload, err := json.Marshal(pipelineEvent)
+			if err != nil {
+				r.AddToDeadletter(payload)
+				return err
+			}
+			topic := r.options.RouterQueue
+			r.Publish(topic, pipelineEventPayload, 0)
+		case Error:
+			// Send to deadletter queue
+			pipelineEventPayload, err := json.Marshal(pipelineEvent)
+			if err != nil {
+				r.AddToDeadletter(payload)
+				return err
+			}
+			topic := r.options.DeadletterQueue
+			r.Publish(topic, pipelineEventPayload, 0)
+		case Cancel:
+			// Nothing to do, just acknowledge, message will be removed from the queue.
+		case Retry:
+			// Republish the same message to the router queue for retry
+			// @TODO: consider adding a retry counter to avoid infinite retries
+		}
+
+		// Always acknowledge messages regardless of sync mode
+		err = d.Ack(false)
+		if err != nil {
+			r.AddToDeadletter(payload)
+			return err
+		}
+
+		// Chrono end
+		endTime := time.Now()
+		processingTime := endTime.Sub(startTime)
+		e := PipelineMetrics{
+			ProcessingTime: processingTime.Seconds(),
+		}
+		handlePrometheus(e)
+	}
+	r.Close()
+	return nil
+}
+
+func (r *RabbitMQ) Close() {
+	if r.Consumer != nil {
+		r.Consumer.Close()
+	}
+	if r.Producer != nil {
+		r.Producer.Close()
+	}
+	if r.Connection != nil {
+		r.Connection.Close()
+	}
+}
+
+// Publish sends a message to the specified RabbitMQ queue
+func (r *RabbitMQ) Publish(queueName string, payload []byte, delaySeconds int) error {
+	if r.Producer == nil {
+		return fmt.Errorf("RabbitMQ producer channel is not initialized")
+	}
+
+	// Publish message to the queue
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Publish message to the specified queue
+	err := r.Producer.PublishWithContext(ctx,
+		"",        // exchange
+		queueName, // routing key (queue name)
+		false,     // mandatory
+		false,     // immediate
+		amqp.Publishing{
+			ContentType: "application/json",
+			Body:        payload,
+		},
+	)
+	return err
+}
+
+// AddToDeadletter adds a message to the deadletter queue
+func (r RabbitMQ) AddToDeadletter(payload []byte) error {
+	topic := r.options.DeadletterQueue
+	return r.Publish(topic, payload, 0)
+}
+
+func (r RabbitMQ) LoadMessages(filename string) error {
+	// This method is only meaningful for MockQueue
 	return nil
 }
