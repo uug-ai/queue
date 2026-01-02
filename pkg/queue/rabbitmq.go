@@ -202,29 +202,6 @@ func (r *RabbitMQ) declareQueue() error {
 	return nil
 }
 
-// PipelineMetrics represents processing metrics for a pipeline event
-type PipelineMetrics struct {
-	ProcessingTime float64 `json:"processingTime,omitempty"`
-}
-
-// HandlerResult represents the result of message handling
-type PipelineAction string
-
-const (
-	// Forward indicates the message should be forwarded to the next stage
-	Forward PipelineAction = "forward"
-	// Cancel indicates the message processing should be cancelled
-	Cancel PipelineAction = "cancel"
-	// Retry indicates the message should be retried
-	Retry PipelineAction = "retry"
-	// Error indicates an error occurred during message processing
-	Error PipelineAction = "error"
-)
-
-// MessageHandler is a function type for handling pipeline events
-type MessageHandler func(models.PipelineEvent, ...any) (PipelineAction, models.PipelineEvent, int)
-type PrometheusHandler func(PipelineMetrics)
-
 // ReadMessages reads messages from the RabbitMQ queue, processes them using the provided handler,
 // and reports metrics using the provided Prometheus handler. It will then take action based on the handler's result.
 // Forwards, cancels, retries or sends to deadletter as needed.
@@ -233,7 +210,7 @@ type PrometheusHandler func(PipelineMetrics)
 // - handleMessage: function to process each message
 // - handlePrometheus: function to handle metrics reporting
 // - args: additional arguments to pass to the message handler
-func (r *RabbitMQ) ReadMessages(handleMessage MessageHandler, handlePrometheus PrometheusHandler, args ...any) error {
+func (r *RabbitMQ) ReadMessages(handleMessage models.MessageHandler, handlePrometheus models.PrometheusHandler, args ...any) error {
 
 	// Subscribe to a queue
 	if r.Consumer == nil {
@@ -276,7 +253,7 @@ func (r *RabbitMQ) ReadMessages(handleMessage MessageHandler, handlePrometheus P
 
 		// Depending on action, we either forward, cancel or retry
 		switch pipelineAction {
-		case Forward:
+		case models.PipelineForward:
 			// Bring event to the next stage
 			pipelineEvent.Stages = pipelineEvent.Stages[1:]
 			if len(pipelineEvent.Stages) == 0 {
@@ -295,7 +272,7 @@ func (r *RabbitMQ) ReadMessages(handleMessage MessageHandler, handlePrometheus P
 				r.AddToDeadletter(payload)
 				return err
 			}
-		case Error:
+		case models.PipelineError:
 			// Send to deadletter queue
 			pipelineEventPayload, err := json.Marshal(pipelineEvent)
 			if err != nil {
@@ -308,9 +285,9 @@ func (r *RabbitMQ) ReadMessages(handleMessage MessageHandler, handlePrometheus P
 				r.AddToDeadletter(payload)
 				return err
 			}
-		case Cancel:
+		case models.PipelineCancel:
 			// Nothing to do, just acknowledge, message will be removed from the queue.
-		case Retry:
+		case models.PipelineRetry:
 			// Re-publish the same message to the same queue for retry
 			backoff := 5
 			r.PublishWithDelay(r.options.ConsumerQueue, payload, backoff)
@@ -326,7 +303,7 @@ func (r *RabbitMQ) ReadMessages(handleMessage MessageHandler, handlePrometheus P
 		// Chrono end
 		endTime := time.Now()
 		processingTime := endTime.Sub(startTime)
-		e := PipelineMetrics{
+		e := models.PipelineMetrics{
 			ProcessingTime: processingTime.Seconds(),
 		}
 		handlePrometheus(e)
@@ -335,7 +312,7 @@ func (r *RabbitMQ) ReadMessages(handleMessage MessageHandler, handlePrometheus P
 	return nil
 }
 
-func (r *RabbitMQ) RouteMessages(handleMessage MessageHandler, handlePrometheus PrometheusHandler, args ...any) error {
+func (r *RabbitMQ) RouteMessages(handleMessage models.MessageHandler, handlePrometheus models.PrometheusHandler, args ...any) error {
 
 	// Subscribe to a queue
 	if r.Consumer == nil {
@@ -391,7 +368,7 @@ func (r *RabbitMQ) RouteMessages(handleMessage MessageHandler, handlePrometheus 
 		// Chrono end
 		endTime := time.Now()
 		processingTime := endTime.Sub(startTime)
-		e := PipelineMetrics{
+		e := models.PipelineMetrics{
 			ProcessingTime: processingTime.Seconds(),
 		}
 		handlePrometheus(e)
