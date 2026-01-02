@@ -5,7 +5,7 @@ go 1.24.10
 require (
 	github.com/go-playground/validator/v10 v10.30.1
 	github.com/rabbitmq/amqp091-go v1.10.0
-	github.com/uug-ai/models v1.2.24
+	github.com/uug-ai/models v1.2.26
 )
 
 require (
