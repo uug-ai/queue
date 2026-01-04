@@ -340,6 +340,12 @@ func (r *RabbitMQ) ReadMessages(handleMessage models.MessageHandler, handleProme
 		}
 		handlePrometheus(e)
 	}
+
+	// Check if connection/channel was closed
+	if r.Consumer.IsClosed() || r.Connection.IsClosed() {
+		return fmt.Errorf("connection lost")
+	}
+
 	r.Close()
 	return nil
 }

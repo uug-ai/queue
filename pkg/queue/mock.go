@@ -180,30 +180,6 @@ func (m *MockQueue) Publish(queueName string, payload []byte) error {
 	return nil
 }
 
-// SendMessageFifo simulates sending a FIFO message with deduplication
-func (m *MockQueue) SendMessageFifo(queueName string, bytes []byte, deduplicationId string) error {
-
-	// Parse the payload as a PipelineEvent
-	var pipelineEvent models.PipelineEvent
-	if err := json.Unmarshal(bytes, &pipelineEvent); err != nil {
-		return err
-	}
-
-	// Check for duplicate messages (simple deduplication)
-	for _, msg := range m.sentMessages {
-		if msg == string(bytes) {
-			return nil
-		}
-	}
-
-	// Add the message to internal queue
-	m.messageQueue = append(m.messageQueue, pipelineEvent)
-
-	// Store the message payload for testing purposes
-	m.sentMessages = append(m.sentMessages, string(bytes))
-	return nil
-}
-
 // Helper methods for testing
 // AddMessageToQueue adds a message directly to the internal queue for testing
 func (m *MockQueue) AddMessageToQueue(event models.PipelineEvent) {
