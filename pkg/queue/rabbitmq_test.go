@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -17,7 +18,9 @@ func TestRabbitOptionsValidation(t *testing.T) {
 			name: "ValidOptionsComplete",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
-					SetQueueName("test-queue").
+					SetConsumerQueue("test-queue").
+					SetDeadletterQueue("test-queue-dlq").
+					SetRouterQueue("test-queue-router").
 					SetUri("amqp://user:pass@localhost:5672/").
 					SetHost("localhost:5672").
 					SetUsername("user").
@@ -31,7 +34,9 @@ func TestRabbitOptionsValidation(t *testing.T) {
 			name: "ValidOptionsMinimal",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
-					SetQueueName("test-queue").
+					SetConsumerQueue("test-queue").
+					SetDeadletterQueue("test-queue-dlq").
+					SetRouterQueue("test-queue-router").
 					SetUri("amqp://localhost").
 					SetHost("localhost").
 					SetUsername("guest").
@@ -42,9 +47,11 @@ func TestRabbitOptionsValidation(t *testing.T) {
 			expectError: false,
 		},
 		{
-			name: "MissingQueueName",
+			name: "MissingConsumerQueue",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
+					SetDeadletterQueue("test-queue-dlq").
+					SetRouterQueue("test-queue-router").
 					SetUri("amqp://localhost").
 					SetHost("localhost").
 					SetUsername("user").
@@ -58,7 +65,9 @@ func TestRabbitOptionsValidation(t *testing.T) {
 			name: "MissingHost",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
-					SetQueueName("test-queue").
+					SetConsumerQueue("test-queue").
+					SetDeadletterQueue("test-queue-dlq").
+					SetRouterQueue("test-queue-router").
 					SetUri("amqp://localhost").
 					SetUsername("user").
 					SetPassword("pass").
@@ -71,7 +80,9 @@ func TestRabbitOptionsValidation(t *testing.T) {
 			name: "MissingUsername",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
-					SetQueueName("test-queue").
+					SetConsumerQueue("test-queue").
+					SetDeadletterQueue("test-queue-dlq").
+					SetRouterQueue("test-queue-router").
 					SetUri("amqp://localhost").
 					SetHost("localhost").
 					SetPassword("pass").
@@ -84,7 +95,9 @@ func TestRabbitOptionsValidation(t *testing.T) {
 			name: "MissingPassword",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
-					SetQueueName("test-queue").
+					SetConsumerQueue("test-queue").
+					SetDeadletterQueue("test-queue-dlq").
+					SetRouterQueue("test-queue-router").
 					SetUri("amqp://localhost").
 					SetHost("localhost").
 					SetUsername("user").
@@ -104,7 +117,9 @@ func TestRabbitOptionsValidation(t *testing.T) {
 			name: "ValidOptionsWithAmqps",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
-					SetQueueName("secure-queue").
+					SetConsumerQueue("secure-queue").
+					SetDeadletterQueue("secure-queue-dlq").
+					SetRouterQueue("secure-queue-router").
 					SetUri("amqps://user:pass@localhost:5671/").
 					SetHost("amqps://localhost:5671").
 					SetUsername("user").
@@ -136,7 +151,9 @@ func TestRabbitOptionsValidation(t *testing.T) {
 func TestRabbitOptionsBuilder(t *testing.T) {
 	t.Run("BuilderSettersChaining", func(t *testing.T) {
 		opts := NewRabbitOptions().
-			SetQueueName("test-queue").
+			SetConsumerQueue("test-queue").
+			SetDeadletterQueue("test-queue-dlq").
+			SetRouterQueue("test-queue-router").
 			SetUri("amqp://testuser:testpass@localhost:5672/testvhost").
 			SetHost("localhost:5672").
 			SetUsername("testuser").
@@ -144,8 +161,14 @@ func TestRabbitOptionsBuilder(t *testing.T) {
 			SetExchange("test-exchange").
 			Build()
 
-		if opts.QueueName != "test-queue" {
-			t.Errorf("expected QueueName to be 'test-queue', got '%s'", opts.QueueName)
+		if opts.ConsumerQueue != "test-queue" {
+			t.Errorf("expected ConsumerQueue to be 'test-queue', got '%s'", opts.ConsumerQueue)
+		}
+		if opts.DeadletterQueue != "test-queue-dlq" {
+			t.Errorf("expected DeadletterQueue to be 'test-queue-dlq', got '%s'", opts.DeadletterQueue)
+		}
+		if opts.RouterQueue != "test-queue-router" {
+			t.Errorf("expected RouterQueue to be 'test-queue-router', got '%s'", opts.RouterQueue)
 		}
 		if opts.Uri != "amqp://testuser:testpass@localhost:5672/testvhost" {
 			t.Errorf("expected Uri to be 'amqp://testuser:testpass@localhost:5672/testvhost', got '%s'", opts.Uri)
@@ -170,8 +193,14 @@ func TestRabbitOptionsBuilder(t *testing.T) {
 			SetHost("localhost").
 			Build()
 
-		if opts.QueueName != "" {
-			t.Errorf("expected QueueName to be empty by default, got '%s'", opts.QueueName)
+		if opts.ConsumerQueue != "" {
+			t.Errorf("expected ConsumerQueue to be empty by default, got '%s'", opts.ConsumerQueue)
+		}
+		if opts.DeadletterQueue != "" {
+			t.Errorf("expected DeadletterQueue to be empty by default, got '%s'", opts.DeadletterQueue)
+		}
+		if opts.RouterQueue != "" {
+			t.Errorf("expected RouterQueue to be empty by default, got '%s'", opts.RouterQueue)
 		}
 		if opts.Uri != "amqp://localhost" {
 			t.Errorf("expected Uri to be set, got '%s'", opts.Uri)
@@ -193,8 +222,14 @@ func TestRabbitOptionsBuilder(t *testing.T) {
 	t.Run("EmptyBuilder", func(t *testing.T) {
 		opts := NewRabbitOptions().Build()
 
-		if opts.QueueName != "" {
-			t.Errorf("expected QueueName to be empty, got '%s'", opts.QueueName)
+		if opts.ConsumerQueue != "" {
+			t.Errorf("expected ConsumerQueue to be empty, got '%s'", opts.ConsumerQueue)
+		}
+		if opts.DeadletterQueue != "" {
+			t.Errorf("expected DeadletterQueue to be empty, got '%s'", opts.DeadletterQueue)
+		}
+		if opts.RouterQueue != "" {
+			t.Errorf("expected RouterQueue to be empty, got '%s'", opts.RouterQueue)
 		}
 		if opts.Uri != "" {
 			t.Errorf("expected Uri to be empty, got '%s'", opts.Uri)
@@ -225,7 +260,9 @@ func TestRabbitConnectionStringGeneration(t *testing.T) {
 			name: "BasicAmqpProtocol",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
-					SetQueueName("test-queue").
+					SetConsumerQueue("test-queue").
+					SetDeadletterQueue("test-queue-dlq").
+					SetRouterQueue("test-queue-router").
 					SetUri("amqp://localhost").
 					SetHost("localhost:5672").
 					SetUsername("user").
@@ -239,7 +276,9 @@ func TestRabbitConnectionStringGeneration(t *testing.T) {
 			name: "AmqpsProtocol",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
-					SetQueueName("test-queue").
+					SetConsumerQueue("test-queue").
+					SetDeadletterQueue("test-queue-dlq").
+					SetRouterQueue("test-queue-router").
 					SetUri("amqps://localhost").
 					SetHost("amqps://localhost:5671").
 					SetUsername("user").
@@ -253,7 +292,9 @@ func TestRabbitConnectionStringGeneration(t *testing.T) {
 			name: "AmqpProtocol",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
-					SetQueueName("test-queue").
+					SetConsumerQueue("test-queue").
+					SetDeadletterQueue("test-queue-dlq").
+					SetRouterQueue("test-queue-router").
 					SetUri("amqp://localhost").
 					SetHost("amqp://localhost:5672").
 					SetUsername("user").
@@ -267,7 +308,9 @@ func TestRabbitConnectionStringGeneration(t *testing.T) {
 			name: "NoProtocolInHost",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
-					SetQueueName("test-queue").
+					SetConsumerQueue("test-queue").
+					SetDeadletterQueue("test-queue-dlq").
+					SetRouterQueue("test-queue-router").
 					SetUri("amqp://localhost").
 					SetHost("localhost:5672").
 					SetUsername("guest").
@@ -305,6 +348,11 @@ func TestRabbitMQIntegration(t *testing.T) {
 	queueName := os.Getenv("RABBITMQ_QUEUE_NAME")
 	exchange := os.Getenv("RABBITMQ_EXCHANGE")
 
+	// Skip integration tests if required environment variables are not set
+	if host == "" || username == "" || password == "" {
+		t.Skip("Skipping integration tests: RABBITMQ_HOST, RABBITMQ_USERNAME, and RABBITMQ_PASSWORD must be set")
+	}
+
 	// Set defaults for optional values
 	if queueName == "" {
 		queueName = "test-integration-queue"
@@ -313,7 +361,9 @@ func TestRabbitMQIntegration(t *testing.T) {
 	t.Run("ConnectToRealRabbitMQ", func(t *testing.T) {
 		// Build RabbitMQ options from environment variables
 		opts := NewRabbitOptions().
-			SetQueueName(queueName).
+			SetConsumerQueue(queueName).
+			SetDeadletterQueue(queueName + "-dlq").
+			SetRouterQueue(queueName + "-router").
 			SetUri(uri).
 			SetHost(host).
 			SetUsername(username).
@@ -362,7 +412,9 @@ func TestRabbitMQIntegration(t *testing.T) {
 
 	t.Run("ConnectionHealthCheck", func(t *testing.T) {
 		opts := NewRabbitOptions().
-			SetQueueName(queueName).
+			SetConsumerQueue(queueName).
+			SetDeadletterQueue(queueName + "-dlq").
+			SetRouterQueue(queueName + "-router").
 			SetUri(uri).
 			SetHost(host).
 			SetUsername(username).
@@ -398,7 +450,9 @@ func TestRabbitMQIntegration(t *testing.T) {
 
 	t.Run("MultipleConnections", func(t *testing.T) {
 		opts := NewRabbitOptions().
-			SetQueueName(queueName).
+			SetConsumerQueue(queueName).
+			SetDeadletterQueue(queueName + "-dlq").
+			SetRouterQueue(queueName + "-router").
 			SetUri(uri).
 			SetHost(host).
 			SetUsername(username).
@@ -433,5 +487,260 @@ func TestRabbitMQIntegration(t *testing.T) {
 		}
 
 		t.Log("Successfully created and closed multiple connections")
+	})
+}
+
+// TestFormatQueueName tests the formatQueueName function that applies legacy naming convention
+func TestFormatQueueName(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "Simple queue name",
+			input:    "test",
+			expected: "kcloud-test-queue",
+		},
+		{
+			name:     "Queue name with dashes",
+			input:    "test-service",
+			expected: "kcloud-test-service-queue",
+		},
+		{
+			name:     "Empty string",
+			input:    "",
+			expected: "kcloud--queue",
+		},
+		{
+			name:     "Queue name with underscores",
+			input:    "test_service",
+			expected: "kcloud-test_service-queue",
+		},
+		{
+			name:     "Queue name with numbers",
+			input:    "test123",
+			expected: "kcloud-test123-queue",
+		},
+	}
+
+	// Create a minimal RabbitMQ instance for testing
+	rabbit := &RabbitMQ{}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := rabbit.formatQueueName(tt.input)
+			if result != tt.expected {
+				t.Errorf("formatQueueName(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestDisasterRecovery tests the DisasterRecovery function
+func TestDisasterRecovery(t *testing.T) {
+	t.Run("WithHandler", func(t *testing.T) {
+		// Create a RabbitMQ instance using the builder pattern
+		opts := NewRabbitOptions().
+			SetConsumerQueue("test-queue").
+			SetDeadletterQueue("test-queue-dlq").
+			SetRouterQueue("test-queue-router").
+			SetHost("localhost").
+			SetUsername("guest").
+			SetPassword("guest").
+			Build()
+
+		rabbit, err := NewRabbitMQ(opts)
+		if err != nil {
+			t.Fatalf("failed to create RabbitMQ instance: %v", err)
+		}
+
+		// Track whether handler was called and with what payload
+		var handlerCalled bool
+		var receivedPayload []byte
+		var handlerError error
+
+		// Set a custom disaster recovery handler
+		rabbit.SetDisasterRecoveryHandler(func(payload []byte) error {
+			handlerCalled = true
+			receivedPayload = payload
+			return handlerError
+		})
+
+		// Test payload
+		testPayload := []byte(`{"test": "data"}`)
+
+		// Call DisasterRecovery
+		err = rabbit.DisasterRecovery(testPayload)
+
+		// Verify handler was called
+		if !handlerCalled {
+			t.Error("expected disaster recovery handler to be called, but it wasn't")
+		}
+
+		// Verify correct payload was passed
+		if string(receivedPayload) != string(testPayload) {
+			t.Errorf("expected payload %q, got %q", testPayload, receivedPayload)
+		}
+
+		// Verify no error was returned
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+	})
+
+	t.Run("WithHandlerReturningError", func(t *testing.T) {
+		// Create a RabbitMQ instance using the builder pattern
+		opts := NewRabbitOptions().
+			SetConsumerQueue("test-queue").
+			SetDeadletterQueue("test-queue-dlq").
+			SetRouterQueue("test-queue-router").
+			SetHost("localhost").
+			SetUsername("guest").
+			SetPassword("guest").
+			Build()
+
+		rabbit, err := NewRabbitMQ(opts)
+		if err != nil {
+			t.Fatalf("failed to create RabbitMQ instance: %v", err)
+		}
+
+		// Set a handler that returns an error
+		expectedErr := fmt.Errorf("handler error")
+		rabbit.SetDisasterRecoveryHandler(func(payload []byte) error {
+			return expectedErr
+		})
+
+		// Test payload
+		testPayload := []byte(`{"test": "data"}`)
+
+		// Call DisasterRecovery
+		err = rabbit.DisasterRecovery(testPayload)
+
+		// Verify error was returned
+		if err != expectedErr {
+			t.Errorf("expected error %v, got %v", expectedErr, err)
+		}
+	})
+
+	t.Run("WithoutHandler", func(t *testing.T) {
+		// Create a RabbitMQ instance without setting a handler
+		opts := NewRabbitOptions().
+			SetConsumerQueue("test-queue").
+			SetDeadletterQueue("test-queue-dlq").
+			SetRouterQueue("test-queue-router").
+			SetHost("localhost").
+			SetUsername("guest").
+			SetPassword("guest").
+			Build()
+
+		rabbit, err := NewRabbitMQ(opts)
+		if err != nil {
+			t.Fatalf("failed to create RabbitMQ instance: %v", err)
+		}
+
+		// Test payload
+		testPayload := []byte(`{"test": "data"}`)
+
+		// Call DisasterRecovery
+		err = rabbit.DisasterRecovery(testPayload)
+
+		// Verify no error was returned (default behavior)
+		if err != nil {
+			t.Errorf("expected no error when no handler is set, got %v", err)
+		}
+	})
+
+	t.Run("WithEmptyPayload", func(t *testing.T) {
+		// Create a RabbitMQ instance using the builder pattern
+		opts := NewRabbitOptions().
+			SetConsumerQueue("test-queue").
+			SetDeadletterQueue("test-queue-dlq").
+			SetRouterQueue("test-queue-router").
+			SetHost("localhost").
+			SetUsername("guest").
+			SetPassword("guest").
+			Build()
+
+		rabbit, err := NewRabbitMQ(opts)
+		if err != nil {
+			t.Fatalf("failed to create RabbitMQ instance: %v", err)
+		}
+
+		// Track handler call
+		var handlerCalled bool
+		var receivedPayload []byte
+
+		rabbit.SetDisasterRecoveryHandler(func(payload []byte) error {
+			handlerCalled = true
+			receivedPayload = payload
+			return nil
+		})
+
+		// Empty payload
+		testPayload := []byte{}
+
+		// Call DisasterRecovery
+		err = rabbit.DisasterRecovery(testPayload)
+
+		// Verify handler was called
+		if !handlerCalled {
+			t.Error("expected disaster recovery handler to be called")
+		}
+
+		// Verify empty payload was passed
+		if len(receivedPayload) != 0 {
+			t.Errorf("expected empty payload, got %v", receivedPayload)
+		}
+
+		// Verify no error
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+	})
+
+	t.Run("WithNilPayload", func(t *testing.T) {
+		// Create a RabbitMQ instance using the builder pattern
+		opts := NewRabbitOptions().
+			SetConsumerQueue("test-queue").
+			SetDeadletterQueue("test-queue-dlq").
+			SetRouterQueue("test-queue-router").
+			SetHost("localhost").
+			SetUsername("guest").
+			SetPassword("guest").
+			Build()
+
+		rabbit, err := NewRabbitMQ(opts)
+		if err != nil {
+			t.Fatalf("failed to create RabbitMQ instance: %v", err)
+		}
+
+		// Track handler call
+		var handlerCalled bool
+		var receivedPayload []byte
+
+		rabbit.SetDisasterRecoveryHandler(func(payload []byte) error {
+			handlerCalled = true
+			receivedPayload = payload
+			return nil
+		})
+
+		// Call DisasterRecovery with nil
+		err = rabbit.DisasterRecovery(nil)
+
+		// Verify handler was called
+		if !handlerCalled {
+			t.Error("expected disaster recovery handler to be called")
+		}
+
+		// Verify nil payload was passed
+		if receivedPayload != nil {
+			t.Errorf("expected nil payload, got %v", receivedPayload)
+		}
+
+		// Verify no error
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
 	})
 }
