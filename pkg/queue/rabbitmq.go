@@ -18,8 +18,8 @@ type DisasterRecoveryHandler func([]byte) error
 // RabbitOptions holds the configuration for RabbitMQ
 type RabbitOptions struct {
 	ConsumerQueue   string `validate:"required"` // Queue from which to consume messages, one consumer per queue
-	DeadletterQueue string `validate:"required"` // When something goes wrong, messages are sent here
 	RouterQueue     string `validate:"required"` // Router queue for routing messages, the message will be send to this queue if Forward action reached.
+	DeadletterQueue string `validate:"required"` // When something goes wrong, messages are sent here
 	Uri             string
 	Host            string `validate:"required"`
 	Username        string `validate:"required"`
