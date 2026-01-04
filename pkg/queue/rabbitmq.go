@@ -12,6 +12,9 @@ import (
 	"github.com/uug-ai/models/pkg/models"
 )
 
+// DisasterRecoveryHandler is a function type for handling messages that failed to publish
+type DisasterRecoveryHandler func([]byte) error
+
 // RabbitOptions holds the configuration for RabbitMQ
 type RabbitOptions struct {
 	ConsumerQueue   string `validate:"required"` // Queue from which to consume messages, one consumer per queue
@@ -98,11 +101,12 @@ func (b *RabbitOptionsBuilder) Build() *RabbitOptions {
 
 // RabbitMQ wraps rabbitmq.Client to implement the Queue interface
 type RabbitMQ struct {
-	options          *RabbitOptions
-	connectionString string           // e.g., amqp://user:pass@host:port/
-	Connection       *amqp.Connection // The underlying RabbitMQ connection
-	Consumer         *amqp.Channel    // Channel for consuming messages
-	Producer         *amqp.Channel    // Channel for producing messages
+	options                 *RabbitOptions
+	connectionString        string                  // e.g., amqp://user:pass@host:port/
+	Connection              *amqp.Connection        // The underlying RabbitMQ connection
+	Consumer                *amqp.Channel           // Channel for consuming messages
+	Producer                *amqp.Channel           // Channel for producing messages
+	disasterRecoveryHandler DisasterRecoveryHandler // Optional handler for failed messages
 }
 
 // NewRabbitMQ creates a new RabbitMQ with the provided RabbitMQ settings
@@ -127,6 +131,11 @@ func NewRabbitMQ(options *RabbitOptions) (*RabbitMQ, error) {
 		options:          options,
 		connectionString: protocol + options.Username + ":" + options.Password + "@" + host + "/",
 	}, nil
+}
+
+// SetDisasterRecoveryHandler sets a custom disaster recovery handler for failed message publishes
+func (r *RabbitMQ) SetDisasterRecoveryHandler(handler DisasterRecoveryHandler) {
+	r.disasterRecoveryHandler = handler
 }
 
 // Connect establishes the RabbitMQ connection and channels
@@ -242,8 +251,13 @@ func (r *RabbitMQ) ReadMessages(handleMessage models.MessageHandler, handleProme
 		var pipelineEvent models.PipelineEvent
 		err = json.Unmarshal(payload, &pipelineEvent)
 		if err != nil {
-			r.AddToDeadletter(payload)
-			return err
+			// Failed to unmarshal - send to deadletter and ack to remove from queue
+			if dlErr := r.AddToDeadletter(payload); dlErr != nil {
+				// Deadletter failed - use disaster recovery
+				r.DisasterRecovery(payload)
+			}
+			d.Ack(false) // Ack even on error to prevent infinite redelivery
+			continue     // Continue processing next message
 		}
 
 		// We will override payload with the new payload
@@ -263,27 +277,43 @@ func (r *RabbitMQ) ReadMessages(handleMessage models.MessageHandler, handleProme
 			// Marshal updated event
 			pipelineEventPayload, err := json.Marshal(pipelineEvent)
 			if err != nil {
-				r.AddToDeadletter(payload)
-				return err
+				// Marshal failed - send original payload to deadletter
+				if dlErr := r.AddToDeadletter(payload); dlErr != nil {
+					r.DisasterRecovery(payload)
+				}
+				d.Ack(false)
+				continue
 			}
 			topic := r.options.RouterQueue
 			err = r.Publish(topic, pipelineEventPayload)
 			if err != nil {
-				r.AddToDeadletter(payload)
-				return err
+				// Publish failed - send to deadletter
+				if dlErr := r.AddToDeadletter(payload); dlErr != nil {
+					r.DisasterRecovery(payload)
+				}
+				d.Ack(false)
+				continue
 			}
 		case models.PipelineError:
 			// Send to deadletter queue
 			pipelineEventPayload, err := json.Marshal(pipelineEvent)
 			if err != nil {
-				r.AddToDeadletter(payload)
-				return err
+				// Marshal failed - send original payload to deadletter
+				if dlErr := r.AddToDeadletter(payload); dlErr != nil {
+					r.DisasterRecovery(payload)
+				}
+				d.Ack(false)
+				continue
 			}
 			topic := r.options.DeadletterQueue
 			err = r.Publish(topic, pipelineEventPayload)
 			if err != nil {
-				r.AddToDeadletter(payload)
-				return err
+				// Publish to deadletter failed - try with original payload
+				if dlErr := r.AddToDeadletter(payload); dlErr != nil {
+					r.DisasterRecovery(payload)
+				}
+				d.Ack(false)
+				continue
 			}
 		case models.PipelineCancel:
 			// Nothing to do, just acknowledge, message will be removed from the queue.
@@ -296,8 +326,10 @@ func (r *RabbitMQ) ReadMessages(handleMessage models.MessageHandler, handleProme
 		// Always acknowledge messages regardless of sync mode
 		err = d.Ack(false)
 		if err != nil {
-			r.AddToDeadletter(payload)
-			return err
+			// Ack failed - try disaster recovery but continue processing
+			// The message may be redelivered, but we shouldn't stop the consumer
+			r.DisasterRecovery(payload)
+			continue
 		}
 
 		// Chrono end
@@ -344,8 +376,13 @@ func (r *RabbitMQ) RouteMessages(handleMessage models.MessageHandler, handleProm
 		var pipelineEvent models.PipelineEvent
 		err = json.Unmarshal(payload, &pipelineEvent)
 		if err != nil {
-			r.AddToDeadletter(payload)
-			return err
+			// Failed to unmarshal - send to deadletter and ack to remove from queue
+			if dlErr := r.AddToDeadletter(payload); dlErr != nil {
+				// Deadletter failed - use disaster recovery
+				r.DisasterRecovery(payload)
+			}
+			d.Ack(false) // Ack even on error to prevent infinite redelivery
+			continue     // Continue processing next message
 		}
 
 		if len(pipelineEvent.Stages) > 0 {
@@ -353,16 +390,22 @@ func (r *RabbitMQ) RouteMessages(handleMessage models.MessageHandler, handleProm
 			nextQueue = r.formatQueueName(nextQueue) // Apply legacy naming convention, we will remove this later
 			err = r.Publish(nextQueue, payload)
 			if err != nil {
-				r.AddToDeadletter(payload)
-				return err
+				// Publish failed - send to deadletter
+				if dlErr := r.AddToDeadletter(payload); dlErr != nil {
+					r.DisasterRecovery(payload)
+				}
+				d.Ack(false)
+				continue
 			}
 		}
 
 		// Always acknowledge messages regardless of sync mode
 		err = d.Ack(false)
 		if err != nil {
-			r.AddToDeadletter(payload)
-			return err
+			// Ack failed - try disaster recovery but continue processing
+			// The message may be redelivered, but we shouldn't stop the consumer
+			r.DisasterRecovery(payload)
+			continue
 		}
 
 		// Chrono end
@@ -454,9 +497,14 @@ func (r RabbitMQ) AddToDeadletter(payload []byte) error {
 	return r.Publish(topic, payload)
 }
 
-func (r RabbitMQ) DisasterRecovery(payload []byte) error {
-	// We should persist the message on disk or take other actions
-	// @TODO: implement persistent storage or logging
+// DisasterRecovery handles messages that failed to publish
+// Uses the injected disaster recovery handler if provided, otherwise does nothing
+func (r *RabbitMQ) DisasterRecovery(payload []byte) error {
+	if r.disasterRecoveryHandler != nil {
+		return r.disasterRecoveryHandler(payload)
+	}
+	// No handler configured - message will be lost
+	// Consider logging this in production
 	return nil
 }
 

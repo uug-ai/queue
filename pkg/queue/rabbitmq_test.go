@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -534,4 +535,212 @@ func TestFormatQueueName(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDisasterRecovery tests the DisasterRecovery function
+func TestDisasterRecovery(t *testing.T) {
+	t.Run("WithHandler", func(t *testing.T) {
+		// Create a RabbitMQ instance using the builder pattern
+		opts := NewRabbitOptions().
+			SetConsumerQueue("test-queue").
+			SetDeadletterQueue("test-queue-dlq").
+			SetRouterQueue("test-queue-router").
+			SetHost("localhost").
+			SetUsername("guest").
+			SetPassword("guest").
+			Build()
+
+		rabbit, err := NewRabbitMQ(opts)
+		if err != nil {
+			t.Fatalf("failed to create RabbitMQ instance: %v", err)
+		}
+
+		// Track whether handler was called and with what payload
+		var handlerCalled bool
+		var receivedPayload []byte
+		var handlerError error
+
+		// Set a custom disaster recovery handler
+		rabbit.SetDisasterRecoveryHandler(func(payload []byte) error {
+			handlerCalled = true
+			receivedPayload = payload
+			return handlerError
+		})
+
+		// Test payload
+		testPayload := []byte(`{"test": "data"}`)
+
+		// Call DisasterRecovery
+		err = rabbit.DisasterRecovery(testPayload)
+
+		// Verify handler was called
+		if !handlerCalled {
+			t.Error("expected disaster recovery handler to be called, but it wasn't")
+		}
+
+		// Verify correct payload was passed
+		if string(receivedPayload) != string(testPayload) {
+			t.Errorf("expected payload %q, got %q", testPayload, receivedPayload)
+		}
+
+		// Verify no error was returned
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+	})
+
+	t.Run("WithHandlerReturningError", func(t *testing.T) {
+		// Create a RabbitMQ instance using the builder pattern
+		opts := NewRabbitOptions().
+			SetConsumerQueue("test-queue").
+			SetDeadletterQueue("test-queue-dlq").
+			SetRouterQueue("test-queue-router").
+			SetHost("localhost").
+			SetUsername("guest").
+			SetPassword("guest").
+			Build()
+
+		rabbit, err := NewRabbitMQ(opts)
+		if err != nil {
+			t.Fatalf("failed to create RabbitMQ instance: %v", err)
+		}
+
+		// Set a handler that returns an error
+		expectedErr := fmt.Errorf("handler error")
+		rabbit.SetDisasterRecoveryHandler(func(payload []byte) error {
+			return expectedErr
+		})
+
+		// Test payload
+		testPayload := []byte(`{"test": "data"}`)
+
+		// Call DisasterRecovery
+		err = rabbit.DisasterRecovery(testPayload)
+
+		// Verify error was returned
+		if err != expectedErr {
+			t.Errorf("expected error %v, got %v", expectedErr, err)
+		}
+	})
+
+	t.Run("WithoutHandler", func(t *testing.T) {
+		// Create a RabbitMQ instance without setting a handler
+		opts := NewRabbitOptions().
+			SetConsumerQueue("test-queue").
+			SetDeadletterQueue("test-queue-dlq").
+			SetRouterQueue("test-queue-router").
+			SetHost("localhost").
+			SetUsername("guest").
+			SetPassword("guest").
+			Build()
+
+		rabbit, err := NewRabbitMQ(opts)
+		if err != nil {
+			t.Fatalf("failed to create RabbitMQ instance: %v", err)
+		}
+
+		// Test payload
+		testPayload := []byte(`{"test": "data"}`)
+
+		// Call DisasterRecovery
+		err = rabbit.DisasterRecovery(testPayload)
+
+		// Verify no error was returned (default behavior)
+		if err != nil {
+			t.Errorf("expected no error when no handler is set, got %v", err)
+		}
+	})
+
+	t.Run("WithEmptyPayload", func(t *testing.T) {
+		// Create a RabbitMQ instance using the builder pattern
+		opts := NewRabbitOptions().
+			SetConsumerQueue("test-queue").
+			SetDeadletterQueue("test-queue-dlq").
+			SetRouterQueue("test-queue-router").
+			SetHost("localhost").
+			SetUsername("guest").
+			SetPassword("guest").
+			Build()
+
+		rabbit, err := NewRabbitMQ(opts)
+		if err != nil {
+			t.Fatalf("failed to create RabbitMQ instance: %v", err)
+		}
+
+		// Track handler call
+		var handlerCalled bool
+		var receivedPayload []byte
+
+		rabbit.SetDisasterRecoveryHandler(func(payload []byte) error {
+			handlerCalled = true
+			receivedPayload = payload
+			return nil
+		})
+
+		// Empty payload
+		testPayload := []byte{}
+
+		// Call DisasterRecovery
+		err = rabbit.DisasterRecovery(testPayload)
+
+		// Verify handler was called
+		if !handlerCalled {
+			t.Error("expected disaster recovery handler to be called")
+		}
+
+		// Verify empty payload was passed
+		if len(receivedPayload) != 0 {
+			t.Errorf("expected empty payload, got %v", receivedPayload)
+		}
+
+		// Verify no error
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+	})
+
+	t.Run("WithNilPayload", func(t *testing.T) {
+		// Create a RabbitMQ instance using the builder pattern
+		opts := NewRabbitOptions().
+			SetConsumerQueue("test-queue").
+			SetDeadletterQueue("test-queue-dlq").
+			SetRouterQueue("test-queue-router").
+			SetHost("localhost").
+			SetUsername("guest").
+			SetPassword("guest").
+			Build()
+
+		rabbit, err := NewRabbitMQ(opts)
+		if err != nil {
+			t.Fatalf("failed to create RabbitMQ instance: %v", err)
+		}
+
+		// Track handler call
+		var handlerCalled bool
+		var receivedPayload []byte
+
+		rabbit.SetDisasterRecoveryHandler(func(payload []byte) error {
+			handlerCalled = true
+			receivedPayload = payload
+			return nil
+		})
+
+		// Call DisasterRecovery with nil
+		err = rabbit.DisasterRecovery(nil)
+
+		// Verify handler was called
+		if !handlerCalled {
+			t.Error("expected disaster recovery handler to be called")
+		}
+
+		// Verify nil payload was passed
+		if receivedPayload != nil {
+			t.Errorf("expected nil payload, got %v", receivedPayload)
+		}
+
+		// Verify no error
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+	})
 }
