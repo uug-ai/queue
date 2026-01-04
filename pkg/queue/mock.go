@@ -256,7 +256,7 @@ func (m *MockQueue) LoadMessages(filename string) error {
 		if err != nil {
 			return err
 		}
-		err = m.Publish("mock_queue", eventBytes)
+		err = m.Publish(m.options.QueueName, eventBytes)
 		if err != nil {
 			return err
 		}
