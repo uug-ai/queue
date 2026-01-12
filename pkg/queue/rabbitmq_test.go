@@ -325,11 +325,12 @@ func TestRabbitConnectionStringGeneration(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			opts := tt.buildOpts()
-			rabbit, err := NewRabbitMQ(opts)
-
+			queueClient, err := New(opts)
 			if err != nil {
 				t.Fatalf("failed to create RabbitMQ instance: %v", err)
 			}
+
+			rabbit := queueClient.Client.(*RabbitMQ)
 
 			if rabbit.connectionString != tt.expectedConnStr {
 				t.Errorf("expected connection string '%s', got '%s'", tt.expectedConnStr, rabbit.connectionString)
@@ -373,9 +374,15 @@ func TestRabbitMQIntegration(t *testing.T) {
 			Build()
 
 		// Create RabbitMQ instance
-		rabbit, err := NewRabbitMQ(opts)
+		queueClient, err := New(opts)
 		if err != nil {
 			t.Fatalf("Failed to create RabbitMQ instance: %v", err)
+		}
+
+		// Get the underlying RabbitMQ client
+		rabbit, ok := queueClient.Client.(*RabbitMQ)
+		if !ok {
+			t.Fatal("Failed to assert RabbitMQ client type")
 		}
 
 		// Test connection
@@ -422,10 +429,12 @@ func TestRabbitMQIntegration(t *testing.T) {
 			SetExchange(exchange).
 			Build()
 
-		rabbit, err := NewRabbitMQ(opts)
+		queueClient, err := New(opts)
 		if err != nil {
 			t.Fatalf("Failed to create RabbitMQ instance: %v", err)
 		}
+
+		rabbit := queueClient.Client.(*RabbitMQ)
 
 		err = rabbit.Connect()
 		if err != nil {
@@ -463,10 +472,12 @@ func TestRabbitMQIntegration(t *testing.T) {
 		// Create multiple connections
 		connections := make([]*RabbitMQ, 3)
 		for i := 0; i < 3; i++ {
-			rabbit, err := NewRabbitMQ(opts)
+			queueClient, err := New(opts)
 			if err != nil {
 				t.Fatalf("Failed to create RabbitMQ instance %d: %v", i, err)
 			}
+
+			rabbit := queueClient.Client.(*RabbitMQ)
 
 			err = rabbit.Connect()
 			if err != nil {
@@ -550,10 +561,12 @@ func TestDisasterRecovery(t *testing.T) {
 			SetPassword("guest").
 			Build()
 
-		rabbit, err := NewRabbitMQ(opts)
+		queueClient, err := New(opts)
 		if err != nil {
 			t.Fatalf("failed to create RabbitMQ instance: %v", err)
 		}
+
+		rabbit := queueClient.Client.(*RabbitMQ)
 
 		// Track whether handler was called and with what payload
 		var handlerCalled bool
@@ -600,10 +613,12 @@ func TestDisasterRecovery(t *testing.T) {
 			SetPassword("guest").
 			Build()
 
-		rabbit, err := NewRabbitMQ(opts)
+		queueClient, err := New(opts)
 		if err != nil {
 			t.Fatalf("failed to create RabbitMQ instance: %v", err)
 		}
+
+		rabbit := queueClient.Client.(*RabbitMQ)
 
 		// Set a handler that returns an error
 		expectedErr := fmt.Errorf("handler error")
@@ -634,10 +649,12 @@ func TestDisasterRecovery(t *testing.T) {
 			SetPassword("guest").
 			Build()
 
-		rabbit, err := NewRabbitMQ(opts)
+		queueClient, err := New(opts)
 		if err != nil {
 			t.Fatalf("failed to create RabbitMQ instance: %v", err)
 		}
+
+		rabbit := queueClient.Client.(*RabbitMQ)
 
 		// Test payload
 		testPayload := []byte(`{"test": "data"}`)
@@ -662,10 +679,12 @@ func TestDisasterRecovery(t *testing.T) {
 			SetPassword("guest").
 			Build()
 
-		rabbit, err := NewRabbitMQ(opts)
+		queueClient, err := New(opts)
 		if err != nil {
 			t.Fatalf("failed to create RabbitMQ instance: %v", err)
 		}
+
+		rabbit := queueClient.Client.(*RabbitMQ)
 
 		// Track handler call
 		var handlerCalled bool
@@ -710,10 +729,12 @@ func TestDisasterRecovery(t *testing.T) {
 			SetPassword("guest").
 			Build()
 
-		rabbit, err := NewRabbitMQ(opts)
+		queueClient, err := New(opts)
 		if err != nil {
 			t.Fatalf("failed to create RabbitMQ instance: %v", err)
 		}
+
+		rabbit := queueClient.Client.(*RabbitMQ)
 
 		// Track handler call
 		var handlerCalled bool

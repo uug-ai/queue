@@ -28,6 +28,12 @@ type RabbitOptions struct {
 	Exchange        string
 }
 
+// Validate validates the RabbitOptions configuration
+func (r *RabbitOptions) Validate() error {
+	validate := validator.New()
+	return validate.Struct(r)
+}
+
 // RabbitOptionsBuilder provides a fluent interface for building Rabbit options
 type RabbitOptionsBuilder struct {
 	options *RabbitOptions
@@ -111,10 +117,9 @@ type RabbitMQ struct {
 
 // NewRabbitMQ creates a new RabbitMQ with the provided RabbitMQ settings
 func NewRabbitMQ(options *RabbitOptions) (*RabbitMQ, error) {
+
 	// Validate RabbitMQ configuration
-	validate := validator.New()
-	err := validate.Struct(options)
-	if err != nil {
+	if err := options.Validate(); err != nil {
 		return nil, err
 	}
 	// Extract protocol from host if present, otherwise default to amqp://
