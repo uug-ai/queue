@@ -20,6 +20,7 @@ type RabbitOptions struct {
 	ConsumerQueue   string `validate:"required"` // Queue from which to consume messages, one consumer per queue
 	RouterQueue     string `validate:"required"` // Router queue for routing messages, the message will be send to this queue if Forward action reached.
 	DeadletterQueue string `validate:"required"` // When something goes wrong, messages are sent here
+	AnalysisQueue   string // Queue for analysis messages
 	Uri             string
 	Host            string `validate:"required"`
 	Username        string `validate:"required"`
@@ -61,6 +62,12 @@ func (b *RabbitOptionsBuilder) SetDeadletterQueue(queueName string) *RabbitOptio
 // SetRouterQueue sets the router queue name
 func (b *RabbitOptionsBuilder) SetRouterQueue(queueName string) *RabbitOptionsBuilder {
 	b.options.RouterQueue = queueName
+	return b
+}
+
+// SetAnalysisQueue sets the analysis queue name
+func (b *RabbitOptionsBuilder) SetAnalysisQueue(queueName string) *RabbitOptionsBuilder {
+	b.options.AnalysisQueue = queueName
 	return b
 }
 
