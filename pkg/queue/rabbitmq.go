@@ -204,9 +204,9 @@ func (r *RabbitMQ) Reconnect() error {
 	return nil
 }
 
-// declareQueue declares a quorum queue with the configured queue name
+// declareQueue declares quorum queues for the consumer and deadletter queues
 func (r *RabbitMQ) declareQueue() error {
-	// Declare quorum queue (idempotent - succeeds if queue exists with same parameters)
+	// Declare consumer quorum queue (idempotent - succeeds if queue exists with same parameters)
 	_, err := r.Consumer.QueueDeclare(
 		r.options.ConsumerQueue, // name
 		true,                    // durable
@@ -220,6 +220,22 @@ func (r *RabbitMQ) declareQueue() error {
 	if err != nil {
 		return err
 	}
+
+	// Declare deadletter quorum queue
+	_, err = r.Consumer.QueueDeclare(
+		r.options.DeadletterQueue, // name
+		true,                      // durable
+		false,                     // delete when unused
+		false,                     // exclusive
+		false,                     // no-wait
+		amqp.Table{
+			"x-queue-type": "quorum",
+		}, // arguments
+	)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
