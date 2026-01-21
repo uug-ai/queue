@@ -5,60 +5,24 @@ import (
 	"os"
 	"time"
 
-	"github.com/go-playground/validator/v10"
 	"github.com/uug-ai/models/pkg/models"
 )
 
-// MockOptions holds the configuration for MockQueue
-type MockOptions struct {
-	QueueName string `validate:"required"`
-}
-
-// RabbitOptionsBuilder provides a fluent interface for building Rabbit options
-type MockOptionsBuilder struct {
-	options *MockOptions
-}
-
-// MockOptions creates a new Mock options builder
-func NewMockOptions() *MockOptionsBuilder {
-	return &MockOptionsBuilder{
-		options: &MockOptions{},
-	}
-}
-
-// SetQueueName sets the queue name
-func (b *MockOptionsBuilder) SetQueueName(queueName string) *MockOptionsBuilder {
-	b.options.QueueName = queueName
-	return b
-}
-
-// Build builds the MockOptions instance
-func (b *MockOptionsBuilder) Build() *MockOptions {
-	return b.options
-}
-
 // MockQueue is a mock implementation of Queue interface for testing
 type MockQueue struct {
-	options       *MockOptions           // Configuration options
-	sentMessages  []string               // Store messages sent during testing
-	messageQueue  []models.PipelineEvent // In-memory queue to store messages
-	running       bool                   // Running flag for controlling the message loop
-	ConnectCalled bool                   // Flag to indicate if Connect was called
-	ConnectError  error                  // Error to return on Connect
-	CloseCalled   bool                   // Flag to indicate if Close was called
+	options                 *RabbitOptions         // Configuration options
+	sentMessages            []string               // Store messages sent during testing
+	messageQueue            []models.PipelineEvent // In-memory queue to store messages
+	running                 bool                   // Running flag for controlling the message loop
+	ConnectCalled           bool                   // Flag to indicate if Connect was called
+	ConnectError            error                  // Error to return on Connect
+	CloseCalled             bool                   // Flag to indicate if Close was called
+	disasterRecoveryHandler DisasterRecoveryHandler
 }
 
 // NewMock creates a new MockQueue instance
-func NewMock(options *MockOptions) (*MockQueue, error) {
-	// Validate Database configuration
-	validate := validator.New()
-	err := validate.Struct(options)
-	if err != nil {
-		return nil, err
-	}
-
+func NewMockQueue() (*MockQueue, error) {
 	return &MockQueue{
-		options:      options,
 		sentMessages: make([]string, 0),
 		messageQueue: make([]models.PipelineEvent, 0),
 		running:      false,
@@ -71,7 +35,7 @@ func (m *MockQueue) Connect() error {
 }
 
 // Close stops the queue operations and cleans up resources
-func (m *MockQueue) Close() error {
+func (m *MockQueue) Close() {
 	m.CloseCalled = true
 
 	// Stop the message processing loop
@@ -80,7 +44,11 @@ func (m *MockQueue) Close() error {
 	// Clear internal queues
 	m.messageQueue = make([]models.PipelineEvent, 0)
 	m.sentMessages = make([]string, 0)
-	return nil
+}
+
+// Reconnect attempts to re-establish the connection (no-op for mock)
+func (m *MockQueue) Reconnect() error {
+	return m.Connect()
 }
 
 func (m *MockQueue) ReadMessages(handleMessage models.MessageHandler, handlePrometheus models.PrometheusHandler, args ...any) error {
@@ -180,6 +148,32 @@ func (m *MockQueue) Publish(queueName string, payload []byte) error {
 	return nil
 }
 
+// PublishWithDelay sends a message after a delay (simulated for mock)
+func (m *MockQueue) PublishWithDelay(queueName string, payload []byte, backoff int) {
+	// For mock, we just publish immediately without delay
+	_ = m.Publish(queueName, payload)
+}
+
+// AddToDeadletter adds a message to the deadletter queue (no-op for mock)
+func (m *MockQueue) AddToDeadletter(payload []byte) error {
+	// For mock, we just store it as a sent message
+	m.sentMessages = append(m.sentMessages, string(payload))
+	return nil
+}
+
+// DisasterRecovery handles messages that failed to publish
+func (m *MockQueue) DisasterRecovery(payload []byte) error {
+	if m.disasterRecoveryHandler != nil {
+		return m.disasterRecoveryHandler(payload)
+	}
+	return nil
+}
+
+// SetDisasterRecoveryHandler sets a custom disaster recovery handler
+func (m *MockQueue) SetDisasterRecoveryHandler(handler DisasterRecoveryHandler) {
+	m.disasterRecoveryHandler = handler
+}
+
 // Helper methods for testing
 // AddMessageToQueue adds a message directly to the internal queue for testing
 func (m *MockQueue) AddMessageToQueue(event models.PipelineEvent) {
@@ -232,7 +226,7 @@ func (m *MockQueue) LoadMessages(filename string) error {
 		if err != nil {
 			return err
 		}
-		err = m.Publish(m.options.QueueName, eventBytes)
+		err = m.Publish("", eventBytes)
 		if err != nil {
 			return err
 		}
