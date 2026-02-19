@@ -129,6 +129,37 @@ func TestRabbitOptionsValidation(t *testing.T) {
 			},
 			expectError: false,
 		},
+		{
+			name: "ValidOptionsWithExplicitTLS",
+			buildOpts: func() *RabbitOptions {
+				return NewRabbitOptions().
+					SetConsumerQueue("tls-queue").
+					SetDeadletterQueue("tls-queue-dlq").
+					SetRouterQueue("tls-queue-router").
+					SetHost("localhost:5671").
+					SetUsername("user").
+					SetPassword("pass").
+					SetTLS(true).
+					Build()
+			},
+			expectError: false,
+		},
+		{
+			name: "ValidOptionsWithTLSAndCACert",
+			buildOpts: func() *RabbitOptions {
+				return NewRabbitOptions().
+					SetConsumerQueue("tls-queue").
+					SetDeadletterQueue("tls-queue-dlq").
+					SetRouterQueue("tls-queue-router").
+					SetHost("localhost:5671").
+					SetUsername("user").
+					SetPassword("pass").
+					SetTLS(true).
+					SetTLSCACertFile("/path/to/ca.pem").
+					Build()
+			},
+			expectError: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -762,6 +793,208 @@ func TestDisasterRecovery(t *testing.T) {
 		// Verify no error
 		if err != nil {
 			t.Errorf("expected no error, got %v", err)
+		}
+	})
+}
+
+// TestTLSOptionsBuilder tests the TLS-related builder methods
+func TestTLSOptionsBuilder(t *testing.T) {
+	t.Run("SetTLSEnabled", func(t *testing.T) {
+		opts := NewRabbitOptions().
+			SetTLS(true).
+			Build()
+
+		if !opts.TLS {
+			t.Error("expected TLS to be true")
+		}
+	})
+
+	t.Run("SetTLSInsecureSkipVerify", func(t *testing.T) {
+		opts := NewRabbitOptions().
+			SetTLS(true).
+			SetTLSInsecureSkipVerify(true).
+			Build()
+
+		if !opts.TLSInsecureSkipVerify {
+			t.Error("expected TLSInsecureSkipVerify to be true")
+		}
+	})
+
+	t.Run("SetTLSCACertFile", func(t *testing.T) {
+		opts := NewRabbitOptions().
+			SetTLS(true).
+			SetTLSCACertFile("/path/to/ca.pem").
+			Build()
+
+		if opts.TLSCACertFile != "/path/to/ca.pem" {
+			t.Errorf("expected TLSCACertFile to be '/path/to/ca.pem', got '%s'", opts.TLSCACertFile)
+		}
+	})
+
+	t.Run("TLSDefaultsFalse", func(t *testing.T) {
+		opts := NewRabbitOptions().Build()
+
+		if opts.TLS {
+			t.Error("expected TLS to be false by default")
+		}
+		if opts.TLSInsecureSkipVerify {
+			t.Error("expected TLSInsecureSkipVerify to be false by default")
+		}
+		if opts.TLSCACertFile != "" {
+			t.Errorf("expected TLSCACertFile to be empty by default, got '%s'", opts.TLSCACertFile)
+		}
+	})
+}
+
+// TestTLSConnectionString tests that TLS options correctly affect the connection string
+func TestTLSConnectionString(t *testing.T) {
+	tests := []struct {
+		name            string
+		buildOpts       func() *RabbitOptions
+		expectedConnStr string
+		expectedTLS     bool
+	}{
+		{
+			name: "ExplicitTLSForcesAmqps",
+			buildOpts: func() *RabbitOptions {
+				return NewRabbitOptions().
+					SetConsumerQueue("test-queue").
+					SetDeadletterQueue("test-queue-dlq").
+					SetRouterQueue("test-queue-router").
+					SetHost("localhost:5671").
+					SetUsername("user").
+					SetPassword("pass").
+					SetTLS(true).
+					Build()
+			},
+			expectedConnStr: "amqps://user:pass@localhost:5671/",
+			expectedTLS:     true,
+		},
+		{
+			name: "AmqpsHostAutoEnablesTLS",
+			buildOpts: func() *RabbitOptions {
+				return NewRabbitOptions().
+					SetConsumerQueue("test-queue").
+					SetDeadletterQueue("test-queue-dlq").
+					SetRouterQueue("test-queue-router").
+					SetHost("amqps://broker.amazonaws.com:5671").
+					SetUsername("user").
+					SetPassword("pass").
+					Build()
+			},
+			expectedConnStr: "amqps://user:pass@broker.amazonaws.com:5671/",
+			expectedTLS:     true,
+		},
+		{
+			name: "NoTLSUsesAmqp",
+			buildOpts: func() *RabbitOptions {
+				return NewRabbitOptions().
+					SetConsumerQueue("test-queue").
+					SetDeadletterQueue("test-queue-dlq").
+					SetRouterQueue("test-queue-router").
+					SetHost("localhost:5672").
+					SetUsername("user").
+					SetPassword("pass").
+					Build()
+			},
+			expectedConnStr: "amqp://user:pass@localhost:5672/",
+			expectedTLS:     false,
+		},
+		{
+			name: "AWSAmazonMQStyle",
+			buildOpts: func() *RabbitOptions {
+				return NewRabbitOptions().
+					SetConsumerQueue("my-queue").
+					SetDeadletterQueue("my-queue-dlq").
+					SetRouterQueue("my-queue-router").
+					SetHost("amqps://b-xxxx-xxxx.mq.us-east-1.amazonaws.com:5671").
+					SetUsername("admin").
+					SetPassword("secret").
+					SetTLSInsecureSkipVerify(false).
+					Build()
+			},
+			expectedConnStr: "amqps://admin:secret@b-xxxx-xxxx.mq.us-east-1.amazonaws.com:5671/",
+			expectedTLS:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := tt.buildOpts()
+			rabbit, err := NewRabbitMQ(opts)
+			if err != nil {
+				t.Fatalf("failed to create RabbitMQ instance: %v", err)
+			}
+
+			if rabbit.connectionString != tt.expectedConnStr {
+				t.Errorf("expected connection string '%s', got '%s'", tt.expectedConnStr, rabbit.connectionString)
+			}
+
+			if rabbit.options.TLS != tt.expectedTLS {
+				t.Errorf("expected TLS to be %v, got %v", tt.expectedTLS, rabbit.options.TLS)
+			}
+		})
+	}
+}
+
+// TestTLSConnectWithInvalidCACert tests that Connect fails gracefully with invalid CA cert
+func TestTLSConnectWithInvalidCACert(t *testing.T) {
+	t.Run("NonExistentCACertFile", func(t *testing.T) {
+		opts := NewRabbitOptions().
+			SetConsumerQueue("test-queue").
+			SetDeadletterQueue("test-queue-dlq").
+			SetRouterQueue("test-queue-router").
+			SetHost("localhost:5671").
+			SetUsername("user").
+			SetPassword("pass").
+			SetTLS(true).
+			SetTLSCACertFile("/nonexistent/ca.pem").
+			Build()
+
+		rabbit, err := NewRabbitMQ(opts)
+		if err != nil {
+			t.Fatalf("failed to create RabbitMQ instance: %v", err)
+		}
+
+		err = rabbit.Connect()
+		if err == nil {
+			t.Fatal("expected error for non-existent CA cert file, got nil")
+		}
+	})
+
+	t.Run("InvalidCACertContent", func(t *testing.T) {
+		// Create a temp file with invalid PEM content
+		tmpFile, err := os.CreateTemp("", "invalid-ca-*.pem")
+		if err != nil {
+			t.Fatalf("failed to create temp file: %v", err)
+		}
+		defer os.Remove(tmpFile.Name())
+
+		_, err = tmpFile.WriteString("this is not a valid PEM certificate")
+		if err != nil {
+			t.Fatalf("failed to write to temp file: %v", err)
+		}
+		tmpFile.Close()
+
+		opts := NewRabbitOptions().
+			SetConsumerQueue("test-queue").
+			SetDeadletterQueue("test-queue-dlq").
+			SetRouterQueue("test-queue-router").
+			SetHost("localhost:5671").
+			SetUsername("user").
+			SetPassword("pass").
+			SetTLS(true).
+			SetTLSCACertFile(tmpFile.Name()).
+			Build()
+
+		rabbit, err := NewRabbitMQ(opts)
+		if err != nil {
+			t.Fatalf("failed to create RabbitMQ instance: %v", err)
+		}
+
+		err = rabbit.Connect()
+		if err == nil {
+			t.Fatal("expected error for invalid CA cert content, got nil")
 		}
 	})
 }

@@ -2,8 +2,11 @@ package queue
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -27,6 +30,11 @@ type RabbitOptions struct {
 	Password        string `validate:"required"`
 	PrefetchCount   int
 	Exchange        string
+
+	// TLS configuration for secure connections (e.g., AWS Amazon MQ)
+	TLS                   bool   // Enable TLS (auto-enabled when host starts with amqps://)
+	TLSInsecureSkipVerify bool   // Skip TLS certificate verification (development only)
+	TLSCACertFile         string // Path to custom CA certificate file (PEM format)
 }
 
 // Validate validates the RabbitOptions configuration
@@ -107,6 +115,24 @@ func (b *RabbitOptionsBuilder) SetPrefetchCount(count int) *RabbitOptionsBuilder
 	return b
 }
 
+// SetTLS enables TLS for the connection
+func (b *RabbitOptionsBuilder) SetTLS(enabled bool) *RabbitOptionsBuilder {
+	b.options.TLS = enabled
+	return b
+}
+
+// SetTLSInsecureSkipVerify sets whether to skip TLS certificate verification (development only)
+func (b *RabbitOptionsBuilder) SetTLSInsecureSkipVerify(skip bool) *RabbitOptionsBuilder {
+	b.options.TLSInsecureSkipVerify = skip
+	return b
+}
+
+// SetTLSCACertFile sets the path to a custom CA certificate file (PEM format)
+func (b *RabbitOptionsBuilder) SetTLSCACertFile(path string) *RabbitOptionsBuilder {
+	b.options.TLSCACertFile = path
+	return b
+}
+
 // Build builds the Rabbit options
 func (b *RabbitOptionsBuilder) Build() *RabbitOptions {
 	return b.options
@@ -135,9 +161,17 @@ func NewRabbitMQ(options *RabbitOptions) (*RabbitMQ, error) {
 	if strings.HasPrefix(host, "amqps://") {
 		protocol = "amqps://"
 		host = strings.TrimPrefix(host, "amqps://")
+		// Auto-enable TLS when amqps:// protocol is detected
+		options.TLS = true
 	} else if strings.HasPrefix(host, "amqp://") {
 		host = strings.TrimPrefix(host, "amqp://")
 	}
+
+	// If TLS is explicitly enabled, ensure we use amqps:// protocol
+	if options.TLS {
+		protocol = "amqps://"
+	}
+
 	// Build connection string
 	return &RabbitMQ{
 		options:          options,
@@ -158,10 +192,31 @@ func (r *RabbitMQ) Connect() error {
 		prefetchCount = r.options.PrefetchCount
 	}
 
-	// Establish connection, with tweaked
+	// Build TLS configuration if TLS is enabled
+	var tlsConfig *tls.Config
+	if r.options.TLS {
+		tlsConfig = &tls.Config{
+			InsecureSkipVerify: r.options.TLSInsecureSkipVerify,
+		}
+
+		// Load custom CA certificate if provided
+		if r.options.TLSCACertFile != "" {
+			caCert, err := os.ReadFile(r.options.TLSCACertFile)
+			if err != nil {
+				return fmt.Errorf("failed to read CA certificate file: %w", err)
+			}
+			caCertPool := x509.NewCertPool()
+			if !caCertPool.AppendCertsFromPEM(caCert) {
+				return fmt.Errorf("failed to parse CA certificate from %s", r.options.TLSCACertFile)
+			}
+			tlsConfig.RootCAs = caCertPool
+		}
+	}
+
+	// Establish connection, with tweaked config
 	connection, err := amqp.DialConfig(r.connectionString, amqp.Config{
 		Heartbeat:       time.Duration(10) * time.Second, // Set the default heartbeat interval
-		TLSClientConfig: nil,                             // No TLS configuration
+		TLSClientConfig: tlsConfig,                       // TLS configuration (nil when TLS is disabled)
 	})
 	if err != nil {
 		return err
