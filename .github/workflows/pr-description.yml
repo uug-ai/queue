@@ -2,10 +2,6 @@ name: Autofill PR description
 
 on: pull_request
 
-env:
-  PR_NUMBER: ${{ github.event.number }}
-  PROJECT: ${{ github.event.repository.name }}
-  
 jobs:
   openai-pr-description:
     runs-on: ubuntu-22.04
@@ -20,4 +16,5 @@ jobs:
           azure_openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
           azure_openai_endpoint: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
           azure_openai_version: ${{ secrets.AZURE_OPENAI_VERSION }}
+          openai_model: ${{ secrets.OPENAI_MODEL }}
           overwrite_description: true
