@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-playground/validator/v10"
@@ -146,6 +147,7 @@ type RabbitMQ struct {
 	Consumer                *amqp.Channel           // Channel for consuming messages
 	Producer                *amqp.Channel           // Channel for producing messages
 	disasterRecoveryHandler DisasterRecoveryHandler // Optional handler for failed messages
+	mu                      sync.Mutex
 }
 
 // NewRabbitMQ creates a new RabbitMQ with the provided RabbitMQ settings
@@ -186,31 +188,22 @@ func (r *RabbitMQ) SetDisasterRecoveryHandler(handler DisasterRecoveryHandler) {
 
 // Connect establishes the RabbitMQ connection and channels
 func (r *RabbitMQ) Connect() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.connectLocked()
+}
+
+func (r *RabbitMQ) connectLocked() error {
 
 	prefetchCount := 5
 	if r.options.PrefetchCount > 0 {
 		prefetchCount = r.options.PrefetchCount
 	}
 
-	// Build TLS configuration if TLS is enabled
-	var tlsConfig *tls.Config
-	if r.options.TLS {
-		tlsConfig = &tls.Config{
-			InsecureSkipVerify: r.options.TLSInsecureSkipVerify,
-		}
-
-		// Load custom CA certificate if provided
-		if r.options.TLSCACertFile != "" {
-			caCert, err := os.ReadFile(r.options.TLSCACertFile)
-			if err != nil {
-				return fmt.Errorf("failed to read CA certificate file: %w", err)
-			}
-			caCertPool := x509.NewCertPool()
-			if !caCertPool.AppendCertsFromPEM(caCert) {
-				return fmt.Errorf("failed to parse CA certificate from %s", r.options.TLSCACertFile)
-			}
-			tlsConfig.RootCAs = caCertPool
-		}
+	tlsConfig, err := r.buildTLSConfig()
+	if err != nil {
+		return err
 	}
 
 	// Establish connection, with tweaked config
@@ -221,30 +214,48 @@ func (r *RabbitMQ) Connect() error {
 	if err != nil {
 		return err
 	}
-	r.Connection = connection
 
 	// Create channel for producing, publishing messages.
-	r.Producer, err = r.Connection.Channel()
+	producer, err := connection.Channel()
 	if err != nil {
+		_ = connection.Close()
 		return err
 	}
 
 	// Create channel for consuming, receiving messages.
-	r.Consumer, err = r.Connection.Channel()
+	consumer, err := connection.Channel()
 	if err != nil {
+		_ = producer.Close()
+		_ = connection.Close()
 		return err
 	}
 	// prefetch count - max unacked messages per consumer
-	err = r.Consumer.Qos(prefetchCount, 0, false)
+	err = consumer.Qos(prefetchCount, 0, false)
 	if err != nil {
+		_ = consumer.Close()
+		_ = producer.Close()
+		_ = connection.Close()
 		return err
 	}
 
 	// Declare the queue
-	err = r.declareQueue()
+	err = r.declareQueue(consumer)
 	if err != nil {
+		_ = consumer.Close()
+		_ = producer.Close()
+		_ = connection.Close()
 		return err
 	}
+
+	oldConnection := r.Connection
+	oldConsumer := r.Consumer
+	oldProducer := r.Producer
+
+	r.Connection = connection
+	r.Consumer = consumer
+	r.Producer = producer
+
+	r.closeResources(oldConsumer, oldProducer, oldConnection)
 
 	return nil
 }
@@ -252,17 +263,13 @@ func (r *RabbitMQ) Connect() error {
 // Reconnect attempts to re-establish the RabbitMQ connection
 // Basic implementation just calls Connect again
 func (r *RabbitMQ) Reconnect() error {
-	err := r.Connect()
-	if err != nil {
-		return err
-	}
-	return nil
+	return r.Connect()
 }
 
 // declareQueue declares quorum queues for the consumer and deadletter queues
-func (r *RabbitMQ) declareQueue() error {
+func (r *RabbitMQ) declareQueue(consumer *amqp.Channel) error {
 	// Declare consumer quorum queue (idempotent - succeeds if queue exists with same parameters)
-	_, err := r.Consumer.QueueDeclare(
+	_, err := consumer.QueueDeclare(
 		r.options.ConsumerQueue, // name
 		true,                    // durable
 		false,                   // delete when unused
@@ -277,7 +284,7 @@ func (r *RabbitMQ) declareQueue() error {
 	}
 
 	// Declare deadletter quorum queue
-	_, err = r.Consumer.QueueDeclare(
+	_, err = consumer.QueueDeclare(
 		r.options.DeadletterQueue, // name
 		true,                      // durable
 		false,                     // delete when unused
@@ -294,6 +301,102 @@ func (r *RabbitMQ) declareQueue() error {
 	return nil
 }
 
+func (r *RabbitMQ) buildTLSConfig() (*tls.Config, error) {
+	if !r.options.TLS {
+		return nil, nil
+	}
+
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: r.options.TLSInsecureSkipVerify,
+	}
+
+	if r.options.TLSCACertFile == "" {
+		return tlsConfig, nil
+	}
+
+	caCert, err := os.ReadFile(r.options.TLSCACertFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read CA certificate file: %w", err)
+	}
+
+	caCertPool := x509.NewCertPool()
+	if !caCertPool.AppendCertsFromPEM(caCert) {
+		return nil, fmt.Errorf("failed to parse CA certificate from %s", r.options.TLSCACertFile)
+	}
+
+	tlsConfig.RootCAs = caCertPool
+	return tlsConfig, nil
+}
+
+func (r *RabbitMQ) ensureConnected() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if !r.needsReconnectLocked() {
+		return nil
+	}
+
+	return r.connectLocked()
+}
+
+func (r *RabbitMQ) needsReconnect() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.needsReconnectLocked()
+}
+
+func (r *RabbitMQ) needsReconnectLocked() bool {
+	if r.Connection == nil || r.Connection.IsClosed() {
+		return true
+	}
+
+	if r.Consumer == nil || r.Consumer.IsClosed() {
+		return true
+	}
+
+	if r.Producer == nil || r.Producer.IsClosed() {
+		return true
+	}
+
+	return false
+}
+
+func (r *RabbitMQ) currentConsumer() *amqp.Channel {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.Consumer
+}
+
+func (r *RabbitMQ) currentProducer() *amqp.Channel {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.Producer
+}
+
+func (r *RabbitMQ) closeResources(consumer, producer *amqp.Channel, connection *amqp.Connection) {
+	if consumer != nil {
+		_ = consumer.Close()
+	}
+	if producer != nil {
+		_ = producer.Close()
+	}
+	if connection != nil {
+		_ = connection.Close()
+	}
+}
+
+func isClosedError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	message := err.Error()
+	return strings.Contains(message, "channel/connection is not open") || strings.Contains(message, "connection is not open")
+}
+
 // ReadMessages reads messages from the RabbitMQ queue, processes them using the provided handler,
 // and reports metrics using the provided Prometheus handler. It will then take action based on the handler's result.
 // Forwards, cancels, retries or sends to deadletter as needed.
@@ -303,222 +406,249 @@ func (r *RabbitMQ) declareQueue() error {
 // - handlePrometheus: function to handle metrics reporting
 // - args: additional arguments to pass to the message handler
 func (r *RabbitMQ) ReadMessages(handleMessage models.MessageHandler, handlePrometheus models.PrometheusHandler, args ...any) error {
+	for {
+		if err := r.ensureConnected(); err != nil {
+			return err
+		}
 
-	// Subscribe to a queue
-	if r.Consumer == nil {
-		return fmt.Errorf("RabbitMQ channel is not initialized")
-	}
+		consumer := r.currentConsumer()
+		if consumer == nil {
+			return fmt.Errorf("RabbitMQ channel is not initialized")
+		}
 
-	msgs, err := r.Consumer.Consume(
-		r.options.ConsumerQueue, // queue
-		"",                      // consumer
-		false,                   // auto-ack
-		false,                   // exclusive
-		false,                   // no-local
-		false,                   // no-wait
-		nil,
-	)
-	if err != nil {
-		return err
-	}
-
-	for d := range msgs {
-
-		// Chrono start, we will measure processing time (start to end)
-		startTime := time.Now()
-
-		// Extract message
-		payload := d.Body
-
-		// Unmarshal message body into PipelineEvent
-		var pipelineEvent models.PipelineEvent
-		err = json.Unmarshal(payload, &pipelineEvent)
+		msgs, err := consumer.Consume(
+			r.options.ConsumerQueue, // queue
+			"",                      // consumer
+			false,                   // auto-ack
+			false,                   // exclusive
+			false,                   // no-local
+			false,                   // no-wait
+			nil,
+		)
 		if err != nil {
-			// Failed to unmarshal - send to deadletter and ack to remove from queue
-			if dlErr := r.AddToDeadletter(payload); dlErr != nil {
-				// Deadletter failed - use disaster recovery
+			if (r.needsReconnect() || isClosedError(err)) && r.Reconnect() == nil {
+				continue
+			}
+			return err
+		}
+
+		for d := range msgs {
+
+			// Chrono start, we will measure processing time (start to end)
+			startTime := time.Now()
+
+			// Extract message
+			payload := d.Body
+
+			// Unmarshal message body into PipelineEvent
+			var pipelineEvent models.PipelineEvent
+			err = json.Unmarshal(payload, &pipelineEvent)
+			if err != nil {
+				// Failed to unmarshal - send to deadletter and ack to remove from queue
+				if dlErr := r.AddToDeadletter(payload); dlErr != nil {
+					// Deadletter failed - use disaster recovery
+					r.DisasterRecovery(payload)
+				}
+				d.Ack(false) // Ack even on error to prevent infinite redelivery
+				continue     // Continue processing next message
+			}
+
+			// We will override payload with the new payload
+			// some consumers might provide additional information, that can be leveraged
+			// later (stateful messaging).
+			pipelineAction, pipelineEvent, _ := handleMessage(pipelineEvent, args...)
+
+			// Depending on action, we either forward, cancel or retry
+			switch pipelineAction {
+			case models.PipelineForward:
+				// Bring event to the next stage
+				pipelineEvent.Stages = pipelineEvent.Stages[1:]
+				if len(pipelineEvent.Stages) == 0 {
+					// No more stages, nothing to do
+					break
+				}
+				// Marshal updated event
+				pipelineEventPayload, err := json.Marshal(pipelineEvent)
+				if err != nil {
+					// Marshal failed - send original payload to deadletter
+					if dlErr := r.AddToDeadletter(payload); dlErr != nil {
+						r.DisasterRecovery(payload)
+					}
+					d.Ack(false)
+					continue
+				}
+				topic := r.options.RouterQueue
+				err = r.Publish(topic, pipelineEventPayload)
+				if err != nil {
+					// Publish failed - send to deadletter
+					if dlErr := r.AddToDeadletter(payload); dlErr != nil {
+						r.DisasterRecovery(payload)
+					}
+					d.Ack(false)
+					continue
+				}
+			case models.PipelineError:
+				// Send to deadletter queue
+				pipelineEventPayload, err := json.Marshal(pipelineEvent)
+				if err != nil {
+					// Marshal failed - send original payload to deadletter
+					if dlErr := r.AddToDeadletter(payload); dlErr != nil {
+						r.DisasterRecovery(payload)
+					}
+					d.Ack(false)
+					continue
+				}
+				topic := r.options.DeadletterQueue
+				err = r.Publish(topic, pipelineEventPayload)
+				if err != nil {
+					// Publish to deadletter failed - try with original payload
+					if dlErr := r.AddToDeadletter(payload); dlErr != nil {
+						r.DisasterRecovery(payload)
+					}
+					d.Ack(false)
+					continue
+				}
+			case models.PipelineCancel:
+				// Nothing to do, just acknowledge, message will be removed from the queue.
+			case models.PipelineRetry:
+				// Re-publish the same message to the same queue for retry
+				backoff := 5
+				r.PublishWithDelay(r.options.ConsumerQueue, payload, backoff)
+			}
+
+			// Always acknowledge messages regardless of sync mode
+			err = d.Ack(false)
+			if err != nil {
+				// Ack failed - try disaster recovery but continue processing
+				// The message may be redelivered, but we shouldn't stop the consumer
 				r.DisasterRecovery(payload)
+				continue
 			}
-			d.Ack(false) // Ack even on error to prevent infinite redelivery
-			continue     // Continue processing next message
+
+			// Chrono end
+			endTime := time.Now()
+			processingTime := endTime.Sub(startTime)
+			e := models.PipelineMetrics{
+				ProcessingTime: processingTime.Seconds(),
+			}
+			handlePrometheus(e)
 		}
 
-		// We will override payload with the new payload
-		// some consumers might provide additional information, that can be leveraged
-		// later (stateful messaging).
-		pipelineAction, pipelineEvent, _ := handleMessage(pipelineEvent, args...)
-
-		// Depending on action, we either forward, cancel or retry
-		switch pipelineAction {
-		case models.PipelineForward:
-			// Bring event to the next stage
-			pipelineEvent.Stages = pipelineEvent.Stages[1:]
-			if len(pipelineEvent.Stages) == 0 {
-				// No more stages, nothing to do
-				break
+		if r.needsReconnect() {
+			if err := r.Reconnect(); err != nil {
+				return err
 			}
-			// Marshal updated event
-			pipelineEventPayload, err := json.Marshal(pipelineEvent)
-			if err != nil {
-				// Marshal failed - send original payload to deadletter
-				if dlErr := r.AddToDeadletter(payload); dlErr != nil {
-					r.DisasterRecovery(payload)
-				}
-				d.Ack(false)
-				continue
-			}
-			topic := r.options.RouterQueue
-			err = r.Publish(topic, pipelineEventPayload)
-			if err != nil {
-				// Publish failed - send to deadletter
-				if dlErr := r.AddToDeadletter(payload); dlErr != nil {
-					r.DisasterRecovery(payload)
-				}
-				d.Ack(false)
-				continue
-			}
-		case models.PipelineError:
-			// Send to deadletter queue
-			pipelineEventPayload, err := json.Marshal(pipelineEvent)
-			if err != nil {
-				// Marshal failed - send original payload to deadletter
-				if dlErr := r.AddToDeadletter(payload); dlErr != nil {
-					r.DisasterRecovery(payload)
-				}
-				d.Ack(false)
-				continue
-			}
-			topic := r.options.DeadletterQueue
-			err = r.Publish(topic, pipelineEventPayload)
-			if err != nil {
-				// Publish to deadletter failed - try with original payload
-				if dlErr := r.AddToDeadletter(payload); dlErr != nil {
-					r.DisasterRecovery(payload)
-				}
-				d.Ack(false)
-				continue
-			}
-		case models.PipelineCancel:
-			// Nothing to do, just acknowledge, message will be removed from the queue.
-		case models.PipelineRetry:
-			// Re-publish the same message to the same queue for retry
-			backoff := 5
-			r.PublishWithDelay(r.options.ConsumerQueue, payload, backoff)
-		}
-
-		// Always acknowledge messages regardless of sync mode
-		err = d.Ack(false)
-		if err != nil {
-			// Ack failed - try disaster recovery but continue processing
-			// The message may be redelivered, but we shouldn't stop the consumer
-			r.DisasterRecovery(payload)
 			continue
 		}
 
-		// Chrono end
-		endTime := time.Now()
-		processingTime := endTime.Sub(startTime)
-		e := models.PipelineMetrics{
-			ProcessingTime: processingTime.Seconds(),
-		}
-		handlePrometheus(e)
+		r.Close()
+		return nil
 	}
-
-	// Check if connection/channel was closed
-	if r.Consumer.IsClosed() || r.Connection.IsClosed() {
-		return fmt.Errorf("connection lost")
-	}
-
-	r.Close()
-	return nil
 }
 
 func (r *RabbitMQ) RouteMessages(handleMessage models.MessageHandler, handlePrometheus models.PrometheusHandler, args ...any) error {
-
-	// Subscribe to a queue
-	if r.Consumer == nil {
-		return fmt.Errorf("RabbitMQ channel is not initialized")
-	}
-
-	msgs, err := r.Consumer.Consume(
-		r.options.ConsumerQueue, // queue
-		"",                      // consumer
-		false,                   // auto-ack
-		false,                   // exclusive
-		false,                   // no-local
-		false,                   // no-wait
-		nil,
-	)
-	if err != nil {
-		return err
-	}
-
-	for d := range msgs {
-
-		// Chrono start, we will measure processing time (start to end)
-		startTime := time.Now()
-
-		// Extract message
-		payload := d.Body
-
-		// Unmarshal message body into PipelineEvent
-		var pipelineEvent models.PipelineEvent
-		err = json.Unmarshal(payload, &pipelineEvent)
-		if err != nil {
-			// Failed to unmarshal - send to deadletter and ack to remove from queue
-			if dlErr := r.AddToDeadletter(payload); dlErr != nil {
-				// Deadletter failed - use disaster recovery
-				r.DisasterRecovery(payload)
-			}
-			d.Ack(false) // Ack even on error to prevent infinite redelivery
-			continue     // Continue processing next message
+	for {
+		if err := r.ensureConnected(); err != nil {
+			return err
 		}
 
-		if len(pipelineEvent.Stages) > 0 {
-			nextQueue := pipelineEvent.Stages[0]
-			nextQueue = r.formatQueueName(nextQueue) // Apply legacy naming convention, we will remove this later
-			err = r.Publish(nextQueue, payload)
-			if err != nil {
-				// Publish failed - send to deadletter
-				if dlErr := r.AddToDeadletter(payload); dlErr != nil {
-					r.DisasterRecovery(payload)
-				}
-				d.Ack(false)
+		consumer := r.currentConsumer()
+		if consumer == nil {
+			return fmt.Errorf("RabbitMQ channel is not initialized")
+		}
+
+		msgs, err := consumer.Consume(
+			r.options.ConsumerQueue, // queue
+			"",                      // consumer
+			false,                   // auto-ack
+			false,                   // exclusive
+			false,                   // no-local
+			false,                   // no-wait
+			nil,
+		)
+		if err != nil {
+			if (r.needsReconnect() || isClosedError(err)) && r.Reconnect() == nil {
 				continue
 			}
+			return err
 		}
 
-		// Always acknowledge messages regardless of sync mode
-		err = d.Ack(false)
-		if err != nil {
-			// Ack failed - try disaster recovery but continue processing
-			// The message may be redelivered, but we shouldn't stop the consumer
-			r.DisasterRecovery(payload)
+		for d := range msgs {
+
+			// Chrono start, we will measure processing time (start to end)
+			startTime := time.Now()
+
+			// Extract message
+			payload := d.Body
+
+			// Unmarshal message body into PipelineEvent
+			var pipelineEvent models.PipelineEvent
+			err = json.Unmarshal(payload, &pipelineEvent)
+			if err != nil {
+				// Failed to unmarshal - send to deadletter and ack to remove from queue
+				if dlErr := r.AddToDeadletter(payload); dlErr != nil {
+					// Deadletter failed - use disaster recovery
+					r.DisasterRecovery(payload)
+				}
+				d.Ack(false) // Ack even on error to prevent infinite redelivery
+				continue     // Continue processing next message
+			}
+
+			if len(pipelineEvent.Stages) > 0 {
+				nextQueue := pipelineEvent.Stages[0]
+				nextQueue = r.formatQueueName(nextQueue) // Apply legacy naming convention, we will remove this later
+				err = r.Publish(nextQueue, payload)
+				if err != nil {
+					// Publish failed - send to deadletter
+					if dlErr := r.AddToDeadletter(payload); dlErr != nil {
+						r.DisasterRecovery(payload)
+					}
+					d.Ack(false)
+					continue
+				}
+			}
+
+			// Always acknowledge messages regardless of sync mode
+			err = d.Ack(false)
+			if err != nil {
+				// Ack failed - try disaster recovery but continue processing
+				// The message may be redelivered, but we shouldn't stop the consumer
+				r.DisasterRecovery(payload)
+				continue
+			}
+
+			// Chrono end
+			endTime := time.Now()
+			processingTime := endTime.Sub(startTime)
+			e := models.PipelineMetrics{
+				ProcessingTime: processingTime.Seconds(),
+			}
+			handlePrometheus(e)
+		}
+
+		if r.needsReconnect() {
+			if err := r.Reconnect(); err != nil {
+				return err
+			}
 			continue
 		}
 
-		// Chrono end
-		endTime := time.Now()
-		processingTime := endTime.Sub(startTime)
-		e := models.PipelineMetrics{
-			ProcessingTime: processingTime.Seconds(),
-		}
-		handlePrometheus(e)
+		r.Close()
+		return nil
 	}
-	r.Close()
-	return nil
 }
 
 func (r *RabbitMQ) Close() {
-	if r.Consumer != nil {
-		r.Consumer.Close()
-	}
-	if r.Producer != nil {
-		r.Producer.Close()
-	}
-	if r.Connection != nil {
-		r.Connection.Close()
-	}
+	r.mu.Lock()
+	consumer := r.Consumer
+	producer := r.Producer
+	connection := r.Connection
+	r.Consumer = nil
+	r.Producer = nil
+	r.Connection = nil
+	r.mu.Unlock()
+
+	r.closeResources(consumer, producer, connection)
 }
 
 // formatQueueName applies legacy naming convention to queue names
@@ -529,15 +659,33 @@ func (r *RabbitMQ) formatQueueName(queueName string) string {
 
 // Publish sends a message immediately to the specified RabbitMQ queue
 func (r *RabbitMQ) Publish(queueName string, payload []byte) error {
-	if r.Producer == nil {
+	if err := r.ensureConnected(); err != nil {
 		r.DisasterRecovery(payload)
+		return err
+	}
+
+	err := r.publish(queueName, payload)
+	if err != nil && (r.needsReconnect() || isClosedError(err)) {
+		if reconnectErr := r.Reconnect(); reconnectErr == nil {
+			err = r.publish(queueName, payload)
+		}
+	}
+	if err != nil {
+		r.DisasterRecovery(payload)
+	}
+	return err
+}
+
+func (r *RabbitMQ) publish(queueName string, payload []byte) error {
+	producer := r.currentProducer()
+	if producer == nil {
 		return fmt.Errorf("RabbitMQ producer channel is not initialized")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := r.Producer.PublishWithContext(ctx,
+	return producer.PublishWithContext(ctx,
 		"",        // exchange
 		queueName, // routing key (queue name)
 		false,     // mandatory
@@ -547,10 +695,6 @@ func (r *RabbitMQ) Publish(queueName string, payload []byte) error {
 			Body:        payload,
 		},
 	)
-	if err != nil {
-		r.DisasterRecovery(payload)
-	}
-	return err
 }
 
 // PublishWithDelay sends a message to the specified RabbitMQ queue after a delay
@@ -559,29 +703,12 @@ func (r *RabbitMQ) Publish(queueName string, payload []byte) error {
 func (r *RabbitMQ) PublishWithDelay(queueName string, payload []byte, backoff int) {
 	go func() {
 		time.Sleep(time.Duration(backoff) * time.Second)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		// Note: errors from delayed publishes are not returned to caller
-		// Consider adding logging or error channel if needed
-		err := r.Producer.PublishWithContext(ctx,
-			"",        // exchange
-			queueName, // routing key (queue name)
-			false,     // mandatory
-			false,     // immediate
-			amqp.Publishing{
-				ContentType: "application/json",
-				Body:        payload,
-			},
-		)
-		if err != nil {
-			r.DisasterRecovery(payload)
-		}
+		_ = r.Publish(queueName, payload)
 	}()
 }
 
 // AddToDeadletter adds a message to the deadletter queue
-func (r RabbitMQ) AddToDeadletter(payload []byte) error {
+func (r *RabbitMQ) AddToDeadletter(payload []byte) error {
 	topic := r.options.DeadletterQueue
 	return r.Publish(topic, payload)
 }
@@ -597,7 +724,7 @@ func (r *RabbitMQ) DisasterRecovery(payload []byte) error {
 	return nil
 }
 
-func (r RabbitMQ) LoadMessages(filename string) error {
+func (r *RabbitMQ) LoadMessages(filename string) error {
 	// This method is only meaningful for MockQueue
 	return nil
 }
