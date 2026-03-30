@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -576,6 +577,52 @@ func TestFormatQueueName(t *testing.T) {
 				t.Errorf("formatQueueName(%q) = %q, want %q", tt.input, result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestIsClosedError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{
+			name:     "NilError",
+			err:      nil,
+			expected: false,
+		},
+		{
+			name:     "ClosedChannelError",
+			err:      errors.New("Exception (504) Reason: \"channel/connection is not open\""),
+			expected: true,
+		},
+		{
+			name:     "ClosedConnectionError",
+			err:      errors.New("connection is not open"),
+			expected: true,
+		},
+		{
+			name:     "UnrelatedError",
+			err:      errors.New("permission denied"),
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isClosedError(tt.err)
+			if result != tt.expected {
+				t.Errorf("isClosedError(%v) = %v, want %v", tt.err, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestRabbitMQNeedsReconnectWithoutResources(t *testing.T) {
+	rabbit := &RabbitMQ{}
+
+	if !rabbit.needsReconnect() {
+		t.Fatal("expected reconnect to be required when connection resources are missing")
 	}
 }
 
