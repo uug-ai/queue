@@ -462,6 +462,10 @@ func (r *RabbitMQ) ReadMessages(handleMessage models.MessageHandler, handleProme
 			switch pipelineAction {
 			case models.PipelineForward:
 				// Bring event to the next stage
+				if len(pipelineEvent.Stages) == 0 {
+					// No stages to advance, nothing to do
+					break
+				}
 				pipelineEvent.Stages = pipelineEvent.Stages[1:]
 				if len(pipelineEvent.Stages) == 0 {
 					// No more stages, nothing to do
