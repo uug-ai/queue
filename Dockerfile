@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/devcontainers/go:1.24-bookworm AS builder
+FROM mcr.microsoft.com/devcontainers/go:1.25-bookworm AS builder
 
 ENV GOROOT=/usr/local/go
 ENV GOPATH=/go
