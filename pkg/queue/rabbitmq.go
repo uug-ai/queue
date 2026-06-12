@@ -550,6 +550,107 @@ func (r *RabbitMQ) ReadMessages(handleMessage models.MessageHandler, handleProme
 	}
 }
 
+// RawMessageHandler processes a raw queue message body and returns the action
+// the queue layer should take, an optional replacement payload to forward, and
+// a retry backoff (seconds). It is the message-shape-agnostic counterpart to
+// models.MessageHandler: consumers whose queue does not carry a PipelineEvent
+// (e.g. the workflow subsystem, which exchanges models.WorkflowRun) unmarshal
+// the body themselves rather than having the library decode it as a
+// PipelineEvent. The returned payload is only used for the Forward action.
+type RawMessageHandler func(payload []byte, args ...any) (models.PipelineAction, []byte, int)
+
+// ReadRawMessages is ReadMessages without the PipelineEvent codec: it hands the
+// raw message body to the handler and acts on the returned action, so a service
+// can consume a queue carrying any JSON shape. It deliberately does not touch a
+// PipelineEvent's Stages on Forward — Forward simply re-publishes the handler's
+// returned payload to the router queue — because raw consumers manage their own
+// fan-out (the workflow engine publishes to stage queues itself and otherwise
+// cancels). The connection, ack, deadletter and reconnect handling mirror
+// ReadMessages so behaviour is identical apart from the message shape.
+func (r *RabbitMQ) ReadRawMessages(handleMessage RawMessageHandler, handlePrometheus models.PrometheusHandler, args ...any) error {
+	for {
+		if err := r.ensureConnected(); err != nil {
+			return err
+		}
+
+		consumer := r.currentConsumer()
+		if consumer == nil {
+			return fmt.Errorf("RabbitMQ channel is not initialized")
+		}
+
+		msgs, err := consumer.Consume(
+			r.options.ConsumerQueue, // queue
+			"",                      // consumer
+			false,                   // auto-ack
+			false,                   // exclusive
+			false,                   // no-local
+			false,                   // no-wait
+			nil,
+		)
+		if err != nil {
+			if (r.needsReconnect() || isClosedError(err)) && r.Reconnect() == nil {
+				continue
+			}
+			return err
+		}
+
+		for d := range msgs {
+			startTime := time.Now()
+			payload := d.Body
+
+			action, outPayload, backoff := handleMessage(payload, args...)
+
+			switch action {
+			case models.PipelineForward:
+				forwardPayload := outPayload
+				if forwardPayload == nil {
+					forwardPayload = payload
+				}
+				if err := r.Publish(r.options.RouterQueue, forwardPayload); err != nil {
+					if dlErr := r.AddToDeadletter(payload); dlErr != nil {
+						r.DisasterRecovery(payload)
+					}
+					d.Ack(false)
+					continue
+				}
+			case models.PipelineError:
+				if err := r.Publish(r.options.DeadletterQueue, payload); err != nil {
+					if dlErr := r.AddToDeadletter(payload); dlErr != nil {
+						r.DisasterRecovery(payload)
+					}
+					d.Ack(false)
+					continue
+				}
+			case models.PipelineCancel:
+				// Nothing to do, just acknowledge below.
+			case models.PipelineRetry:
+				if backoff <= 0 {
+					backoff = 5
+				}
+				r.PublishWithDelay(r.options.ConsumerQueue, payload, backoff)
+			}
+
+			if err := d.Ack(false); err != nil {
+				r.DisasterRecovery(payload)
+				continue
+			}
+
+			processingTime := time.Since(startTime)
+			handlePrometheus(models.PipelineMetrics{ProcessingTime: processingTime.Seconds()})
+		}
+
+		if r.needsReconnect() {
+			if err := r.Reconnect(); err != nil {
+				return err
+			}
+			continue
+		}
+
+		r.Close()
+		return nil
+	}
+}
+
 func (r *RabbitMQ) RouteMessages(handleMessage models.MessageHandler, handlePrometheus models.PrometheusHandler, args ...any) error {
 	for {
 		if err := r.ensureConnected(); err != nil {
