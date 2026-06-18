@@ -48,6 +48,21 @@ func TestRabbitOptionsValidation(t *testing.T) {
 			expectError: false,
 		},
 		{
+			// A workflow stage worker only consumes and dead-letters; it never
+			// forwards, so RouterQueue (and AnalysisQueue) may be omitted.
+			name: "ValidOptionsStageWorkerNoRouterQueue",
+			buildOpts: func() *RabbitOptions {
+				return NewRabbitOptions().
+					SetConsumerQueue("hub-workflows-loitering").
+					SetDeadletterQueue("dead-letter-queue").
+					SetHost("localhost").
+					SetUsername("user").
+					SetPassword("pass").
+					Build()
+			},
+			expectError: false,
+		},
+		{
 			name: "MissingConsumerQueue",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
