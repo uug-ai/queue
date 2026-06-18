@@ -22,7 +22,7 @@ type DisasterRecoveryHandler func([]byte) error
 // RabbitOptions holds the configuration for RabbitMQ
 type RabbitOptions struct {
 	ConsumerQueue   string `validate:"required"` // Queue from which to consume messages, one consumer per queue
-	RouterQueue     string `validate:"required"` // Router queue for routing messages, the message will be send to this queue if Forward action reached.
+	RouterQueue     string // Router queue; only used — and only needs to be set — when a handler returns the Forward action. Stage workers that never forward may leave it unset.
 	DeadletterQueue string `validate:"required"` // When something goes wrong, messages are sent here
 	AnalysisQueue   string // Queue for analysis messages
 	Uri             string
@@ -620,6 +620,19 @@ func (r *RabbitMQ) ReadRawMessages(handleMessage RawMessageHandler, handlePromet
 
 			switch action {
 			case models.PipelineForward:
+				// Forwarding needs a router queue. Workers that never forward
+				// (e.g. workflow stage workers) leave it unset; treat a forward
+				// with no router queue as a misconfiguration and dead-letter the
+				// message rather than publishing to an empty queue name.
+				if r.options.RouterQueue == "" {
+					if err := r.Publish(r.options.DeadletterQueue, payload); err != nil {
+						if dlErr := r.AddToDeadletter(payload); dlErr != nil {
+							r.DisasterRecovery(payload)
+						}
+					}
+					d.Ack(false)
+					continue
+				}
 				forwardPayload := outPayload
 				if forwardPayload == nil {
 					forwardPayload = payload
