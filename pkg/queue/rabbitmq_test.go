@@ -281,6 +281,47 @@ func TestRabbitOptionsBuilder(t *testing.T) {
 	})
 }
 
+// TestWorkflowsQueueAliases verifies the workflow-oriented builder aliases set
+// the same consumer queue as SetConsumerQueue, so workflow services can use the
+// clearer names without changing behaviour.
+func TestWorkflowsQueueAliases(t *testing.T) {
+	t.Run("SetWorkflowsQueue", func(t *testing.T) {
+		opts := NewRabbitOptions().
+			SetWorkflowsQueue("hub-workflows-queue").
+			SetDeadletterQueue("dead-letter-queue").
+			SetRouterQueue("kcloud-event-queue").
+			SetHost("localhost").
+			SetUsername("user").
+			SetPassword("pass").
+			Build()
+
+		if opts.ConsumerQueue != "hub-workflows-queue" {
+			t.Errorf("expected ConsumerQueue to be 'hub-workflows-queue', got '%s'", opts.ConsumerQueue)
+		}
+		if err := opts.Validate(); err != nil {
+			t.Errorf("expected options to validate, got: %v", err)
+		}
+	})
+
+	t.Run("SetWorkflowsStageQueue", func(t *testing.T) {
+		opts := NewRabbitOptions().
+			SetWorkflowsStageQueue("hub-workflows-loitering").
+			SetDeadletterQueue("dead-letter-queue").
+			SetRouterQueue("kcloud-event-queue").
+			SetHost("localhost").
+			SetUsername("user").
+			SetPassword("pass").
+			Build()
+
+		if opts.ConsumerQueue != "hub-workflows-loitering" {
+			t.Errorf("expected ConsumerQueue to be 'hub-workflows-loitering', got '%s'", opts.ConsumerQueue)
+		}
+		if err := opts.Validate(); err != nil {
+			t.Errorf("expected options to validate, got: %v", err)
+		}
+	})
+}
+
 // TestRabbitConnectionStringGeneration tests the connection string generation logic
 func TestRabbitConnectionStringGeneration(t *testing.T) {
 	tests := []struct {

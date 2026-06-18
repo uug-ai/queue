@@ -89,6 +89,35 @@ Each queue connection follows this pattern:
 4. Call `.Connect()` to establish the connection
 5. Use the client for messaging operations
 
+### Workflow-oriented queue names
+
+The builder's queue setters are named for the original pipeline flow
+(`SetConsumerQueue`, `SetRouterQueue`, `SetAnalysisQueue`). When wiring a
+**workflows** service, two intent-revealing aliases make the role explicit
+without changing behaviour — both configure the service's consume queue:
+
+| Alias | Use on | Equivalent to |
+| --- | --- | --- |
+| `SetWorkflowsQueue(name)` | the hub-workflows **engine** (consumes the workflows queue, e.g. `hub-workflows-queue`) | `SetConsumerQueue` |
+| `SetWorkflowsStageQueue(name)` | a workflow **stage worker** (consumes its `<STAGE>_QUEUE`, e.g. `hub-workflows-loitering`) | `SetConsumerQueue` |
+
+```go
+// Workflows engine
+opts := queue.NewRabbitOptions().
+    SetWorkflowsQueue("hub-workflows-queue").
+    // ...host / credentials / deadletter...
+    Build()
+
+// Workflow stage worker
+opts := queue.NewRabbitOptions().
+    SetWorkflowsStageQueue("hub-workflows-loitering").
+    // ...host / credentials / deadletter...
+    Build()
+```
+
+A stage worker publishes its finished run back to the engine with
+`Publish("hub-workflows-queue", payload)`.
+
 ## Usage Examples
 
 ### RabbitMQ Connection

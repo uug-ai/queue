@@ -62,6 +62,24 @@ func (b *RabbitOptionsBuilder) SetConsumerQueue(queueName string) *RabbitOptions
 	return b
 }
 
+// SetWorkflowsQueue sets the queue the workflows engine consumes from
+// (WORKFLOWS_QUEUE, e.g. "hub-workflows-queue"). It is a workflow-oriented alias
+// for SetConsumerQueue — the engine's consumer queue *is* the workflows queue,
+// and stage workers publish their finished run back to it. Use this when wiring
+// the hub-workflows engine; a stage worker uses SetWorkflowsStageQueue for the
+// queue it consumes.
+func (b *RabbitOptionsBuilder) SetWorkflowsQueue(queueName string) *RabbitOptionsBuilder {
+	return b.SetConsumerQueue(queueName)
+}
+
+// SetWorkflowsStageQueue sets the queue a workflow stage worker consumes its
+// dispatched runs from (its <STAGE>_QUEUE, e.g. "hub-workflows-loitering"). It is
+// a workflow-oriented alias for SetConsumerQueue. The worker handles each run and
+// publishes the result back to the workflows engine queue (see SetWorkflowsQueue).
+func (b *RabbitOptionsBuilder) SetWorkflowsStageQueue(queueName string) *RabbitOptionsBuilder {
+	return b.SetConsumerQueue(queueName)
+}
+
 // SetDeadletterQueue sets the deadletter queue name
 func (b *RabbitOptionsBuilder) SetDeadletterQueue(queueName string) *RabbitOptionsBuilder {
 	b.options.DeadletterQueue = queueName
