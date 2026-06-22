@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -19,6 +20,14 @@ import (
 // DisasterRecoveryHandler is a function type for handling messages that failed to publish
 type DisasterRecoveryHandler func([]byte) error
 
+// ReturnHandler is invoked for every message the broker returns as unroutable
+// (published mandatory with no queue bound to its routing key). With the default
+// exchange the routing key is the target queue name, so a return means the
+// producer is publishing to a queue that does not exist — typically a
+// producer/consumer queue-name drift that is otherwise completely silent. The
+// handler must be cheap and non-blocking; it runs on the return-watcher goroutine.
+type ReturnHandler func(amqp.Return)
+
 // RabbitOptions holds the configuration for RabbitMQ
 type RabbitOptions struct {
 	ConsumerQueue   string `validate:"required"` // Queue from which to consume messages, one consumer per queue
@@ -31,6 +40,12 @@ type RabbitOptions struct {
 	Password        string `validate:"required"`
 	PrefetchCount   int
 	Exchange        string
+
+	// MaxRetries caps how many times a PipelineRetry re-queues a message before
+	// it is parked on the deadletter queue; zero selects defaultMaxRetries. It is
+	// the hard stop that keeps a permanently failing payload from looping the
+	// consumer queue forever (see retryOrDeadletter).
+	MaxRetries int
 
 	// TLS configuration for secure connections (e.g., AWS Amazon MQ)
 	TLS                   bool   // Enable TLS (auto-enabled when host starts with amqps://)
@@ -134,6 +149,15 @@ func (b *RabbitOptionsBuilder) SetPrefetchCount(count int) *RabbitOptionsBuilder
 	return b
 }
 
+// SetMaxRetries caps how many times a PipelineRetry re-queues a message before
+// it is dead-lettered. Zero (the default) selects defaultMaxRetries. Set it to
+// bound how long a transient sink failure is retried before the message is
+// parked for inspection instead of being requeued forever.
+func (b *RabbitOptionsBuilder) SetMaxRetries(maxRetries int) *RabbitOptionsBuilder {
+	b.options.MaxRetries = maxRetries
+	return b
+}
+
 // SetTLS enables TLS for the connection
 func (b *RabbitOptionsBuilder) SetTLS(enabled bool) *RabbitOptionsBuilder {
 	b.options.TLS = enabled
@@ -165,6 +189,7 @@ type RabbitMQ struct {
 	Consumer                *amqp.Channel           // Channel for consuming messages
 	Producer                *amqp.Channel           // Channel for producing messages
 	disasterRecoveryHandler DisasterRecoveryHandler // Optional handler for failed messages
+	returnHandler           ReturnHandler           // Optional handler for unroutable (mandatory-returned) messages
 	mu                      sync.Mutex
 }
 
@@ -202,6 +227,15 @@ func NewRabbitMQ(options *RabbitOptions) (*RabbitMQ, error) {
 // SetDisasterRecoveryHandler sets a custom disaster recovery handler for failed message publishes
 func (r *RabbitMQ) SetDisasterRecoveryHandler(handler DisasterRecoveryHandler) {
 	r.disasterRecoveryHandler = handler
+}
+
+// SetReturnHandler sets a handler invoked for every mandatory message the broker
+// returns as unroutable (no queue bound to the routing key, i.e. the target queue
+// does not exist). Use it to log or increment a metric so a producer/consumer
+// queue-name drift is visible instead of silently dropping messages. When unset,
+// returns are logged via the standard logger so the condition is never silent.
+func (r *RabbitMQ) SetReturnHandler(handler ReturnHandler) {
+	r.returnHandler = handler
 }
 
 // Connect establishes the RabbitMQ connection and channels
@@ -264,6 +298,15 @@ func (r *RabbitMQ) connectLocked() error {
 		_ = connection.Close()
 		return err
 	}
+
+	// Surface unroutable publishes. With the default exchange a message published
+	// mandatory is returned when no queue is bound to its routing key (the target
+	// queue name) — a producer/consumer queue-name drift that would otherwise drop
+	// silently. Register the watcher on the new producer channel; it ends when that
+	// channel closes (closeResources below on the next reconnect), so every fresh
+	// producer channel gets its own watcher.
+	returns := producer.NotifyReturn(make(chan amqp.Return, 16))
+	go r.watchReturns(returns)
 
 	oldConnection := r.Connection
 	oldConsumer := r.Consumer
@@ -406,6 +449,23 @@ func (r *RabbitMQ) closeResources(consumer, producer *amqp.Channel, connection *
 	}
 }
 
+// watchReturns drains the producer channel's mandatory-return notifications until
+// the channel closes (on a reconnect). Each amqp.Return is a message the broker
+// could not route to any queue; with the default exchange that means no queue is
+// bound to the routing key (the target queue name), i.e. a publish target with no
+// consumer queue — a queue-name drift. It is delegated to the configured
+// ReturnHandler, or logged via the standard logger so the condition is never silent.
+func (r *RabbitMQ) watchReturns(returns <-chan amqp.Return) {
+	for ret := range returns {
+		if r.returnHandler != nil {
+			r.returnHandler(ret)
+			continue
+		}
+		log.Printf("queue: message returned as unroutable (no queue bound to routing key %q on exchange %q): replyCode=%d replyText=%q — likely a producer/consumer queue-name drift",
+			ret.RoutingKey, ret.Exchange, ret.ReplyCode, ret.ReplyText)
+	}
+}
+
 func isClosedError(err error) bool {
 	if err == nil {
 		return false
@@ -533,9 +593,11 @@ func (r *RabbitMQ) ReadMessages(handleMessage models.MessageHandler, handleProme
 			case models.PipelineCancel:
 				// Nothing to do, just acknowledge, message will be removed from the queue.
 			case models.PipelineRetry:
-				// Re-publish the same message to the same queue for retry
-				backoff := 5
-				r.PublishWithDelay(r.options.ConsumerQueue, payload, backoff)
+				// Re-queue for another attempt, but capped: retryOrDeadletter tracks
+				// the attempt count on the message and dead-letters it once the cap is
+				// hit, so a permanently failing payload can never loop the consumer
+				// queue forever.
+				r.retryOrDeadletter(d.Headers, payload, 5)
 			}
 
 			// Always acknowledge messages regardless of sync mode
@@ -655,10 +717,12 @@ func (r *RabbitMQ) ReadRawMessages(handleMessage RawMessageHandler, handlePromet
 			case models.PipelineCancel:
 				// Nothing to do, just acknowledge below.
 			case models.PipelineRetry:
-				if backoff <= 0 {
-					backoff = 5
-				}
-				r.PublishWithDelay(r.options.ConsumerQueue, payload, backoff)
+				// Re-queue for another attempt, but capped: retryOrDeadletter tracks
+				// the attempt count on the message and dead-letters it once the cap is
+				// hit, so a permanently failing payload can never loop the consumer
+				// queue forever (the workflow engine's marker-ingest retry that backed
+				// this queue up).
+				r.retryOrDeadletter(d.Headers, payload, backoff)
 			}
 
 			if err := d.Ack(false); err != nil {
@@ -795,15 +859,23 @@ func (r *RabbitMQ) formatQueueName(queueName string) string {
 
 // Publish sends a message immediately to the specified RabbitMQ queue
 func (r *RabbitMQ) Publish(queueName string, payload []byte) error {
+	return r.publishWithReconnect(queueName, payload, nil)
+}
+
+// publishWithReconnect publishes payload (optionally carrying headers) and, on a
+// closed/stale channel, reconnects once and retries. It is the shared body
+// behind Publish and the delayed retry path: headers is nil for an ordinary
+// publish and carries the retry counter when a message is re-queued.
+func (r *RabbitMQ) publishWithReconnect(queueName string, payload []byte, headers amqp.Table) error {
 	if err := r.ensureConnected(); err != nil {
 		r.DisasterRecovery(payload)
 		return err
 	}
 
-	err := r.publish(queueName, payload)
+	err := r.publish(queueName, payload, headers)
 	if err != nil && (r.needsReconnect() || isClosedError(err)) {
 		if reconnectErr := r.Reconnect(); reconnectErr == nil {
-			err = r.publish(queueName, payload)
+			err = r.publish(queueName, payload, headers)
 		}
 	}
 	if err != nil {
@@ -812,7 +884,7 @@ func (r *RabbitMQ) Publish(queueName string, payload []byte) error {
 	return err
 }
 
-func (r *RabbitMQ) publish(queueName string, payload []byte) error {
+func (r *RabbitMQ) publish(queueName string, payload []byte, headers amqp.Table) error {
 	producer := r.currentProducer()
 	if producer == nil {
 		return fmt.Errorf("RabbitMQ producer channel is not initialized")
@@ -824,10 +896,11 @@ func (r *RabbitMQ) publish(queueName string, payload []byte) error {
 	return producer.PublishWithContext(ctx,
 		"",        // exchange
 		queueName, // routing key (queue name)
-		false,     // mandatory
+		true,      // mandatory: return (don't silently drop) a message no queue is bound to
 		false,     // immediate
 		amqp.Publishing{
 			ContentType: "application/json",
+			Headers:     headers,
 			Body:        payload,
 		},
 	)
@@ -837,10 +910,82 @@ func (r *RabbitMQ) publish(queueName string, payload []byte) error {
 // This is non-blocking and runs in a goroutine. Errors are not returned to the caller.
 // For production use, consider adding logging or an error channel.
 func (r *RabbitMQ) PublishWithDelay(queueName string, payload []byte, backoff int) {
+	r.publishWithDelayHeaders(queueName, payload, backoff, nil)
+}
+
+// publishWithDelayHeaders is PublishWithDelay with explicit message headers, used
+// by the capped retry path to carry the incremented retry counter onto the
+// re-queued message. Non-blocking; errors are swallowed exactly as PublishWithDelay.
+func (r *RabbitMQ) publishWithDelayHeaders(queueName string, payload []byte, backoff int, headers amqp.Table) {
 	go func() {
 		time.Sleep(time.Duration(backoff) * time.Second)
-		_ = r.Publish(queueName, payload)
+		_ = r.publishWithReconnect(queueName, payload, headers)
 	}()
+}
+
+// retryCountHeader is the AMQP header the queue layer uses to count how many
+// times a message has been re-queued for a PipelineRetry. It is absent on a
+// first delivery (count 0) and set explicitly on every re-queue.
+const retryCountHeader = "x-retry-count"
+
+// defaultMaxRetries bounds PipelineRetry re-queues when RabbitOptions.MaxRetries
+// is unset. With the default 5s backoff this rides out a brief sink outage
+// (~50s) before the message is dead-lettered instead of looping forever.
+const defaultMaxRetries = 10
+
+// maxRetries returns the configured PipelineRetry cap, or defaultMaxRetries when
+// unset.
+func (r *RabbitMQ) maxRetries() int {
+	if r.options.MaxRetries > 0 {
+		return r.options.MaxRetries
+	}
+	return defaultMaxRetries
+}
+
+// retryCount reads the x-retry-count header off a delivery, tolerating the
+// several integer types AMQP may decode it as. A missing header means this is
+// the first attempt (0).
+func retryCount(headers amqp.Table) int {
+	if headers == nil {
+		return 0
+	}
+	switch v := headers[retryCountHeader].(type) {
+	case int32:
+		return int(v)
+	case int64:
+		return int(v)
+	case int:
+		return v
+	case float64:
+		return int(v)
+	default:
+		return 0
+	}
+}
+
+// retryOrDeadletter handles a PipelineRetry. It re-queues the message to the
+// consumer queue after a delay, carrying an incremented x-retry-count, until the
+// count reaches the configured cap; past the cap it parks the payload on the
+// deadletter queue instead of requeuing. This is the hard stop that keeps a
+// permanently failing payload from looping the consumer queue forever — the
+// failure mode that backed the workflows queue up when a marker write kept being
+// rejected and retried without bound.
+func (r *RabbitMQ) retryOrDeadletter(headers amqp.Table, payload []byte, backoff int) {
+	attempts := retryCount(headers)
+	if attempts >= r.maxRetries() {
+		// Exhausted the retry budget: dead-letter so the message is preserved for
+		// inspection/replay rather than requeued into an unbounded loop.
+		if err := r.AddToDeadletter(payload); err != nil {
+			r.DisasterRecovery(payload)
+		}
+		return
+	}
+	if backoff <= 0 {
+		backoff = 5
+	}
+	r.publishWithDelayHeaders(r.options.ConsumerQueue, payload, backoff, amqp.Table{
+		retryCountHeader: int32(attempts + 1),
+	})
 }
 
 // AddToDeadletter adds a message to the deadletter queue
