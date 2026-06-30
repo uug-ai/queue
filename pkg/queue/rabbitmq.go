@@ -630,6 +630,49 @@ func (r *RabbitMQ) ReadMessages(handleMessage models.MessageHandler, handleProme
 	}
 }
 
+// ReadOneRaw pulls a single message from the consumer queue, hands its raw body
+// to handler, and acts on the returned action exactly once before returning —
+// the bounded, one-shot counterpart to ReadRawMessages. It is built for verify
+// or drain tooling that wants to inspect a single message without joining the
+// long-lived consume loop. The returned bool is false (no error) when the queue
+// is empty. Action mapping: Cancel acks (removes), Retry/Forward requeue (the
+// message is left on the queue, untouched), Error dead-letters. A nil-ack/nack
+// failure is reported. The handler's replacement payload is ignored; this never
+// publishes onward.
+func (r *RabbitMQ) ReadOneRaw(handleMessage RawMessageHandler, args ...any) (bool, error) {
+	if err := r.ensureConnected(); err != nil {
+		return false, err
+	}
+	consumer := r.currentConsumer()
+	if consumer == nil {
+		return false, fmt.Errorf("RabbitMQ channel is not initialized")
+	}
+
+	d, ok, err := consumer.Get(r.options.ConsumerQueue, false)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+
+	action, _, _ := handleMessage(d.Body, args...)
+	switch action {
+	case models.PipelineCancel:
+		return true, d.Ack(false)
+	case models.PipelineError:
+		if pubErr := r.Publish(r.options.DeadletterQueue, d.Body); pubErr != nil {
+			if dlErr := r.AddToDeadletter(d.Body); dlErr != nil {
+				r.DisasterRecovery(d.Body)
+			}
+		}
+		return true, d.Ack(false)
+	default:
+		// Retry/Forward/unknown: requeue, leaving the queue intact.
+		return true, d.Nack(false, true)
+	}
+}
+
 // RawMessageHandler processes a raw queue message body and returns the action
 // the queue layer should take, an optional replacement payload to forward, and
 // a retry backoff (seconds). It is the message-shape-agnostic counterpart to
