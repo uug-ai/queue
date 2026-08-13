@@ -48,6 +48,8 @@ func New(opts QueueOptions, client ...QueueInterface) (*Queue, error) {
 			q, err = NewRabbitMQ(rabbitOpts)
 		case *KafkaOptions:
 			q, err = NewKafka(queueOpts)
+		case *AzureEventHubOptions:
+			q, err = NewAzureEventHub(queueOpts)
 		default:
 			return nil, fmt.Errorf("unsupported queue options type")
 		}

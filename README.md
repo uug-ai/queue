@@ -17,6 +17,7 @@ different message brokers.
 | --- | --- | --- |
 | RabbitMQ | `amqp091-go` | [RabbitMQ guide](README.rabbitmq.md) |
 | Kafka | Confluent Kafka Go client | [Kafka guide](README.kafka.md) |
+| Azure Event Hubs | Kafka-compatible endpoint | [Event Hubs guide](README.azure-event-hubs.md) |
 
 The broker guides contain provider-specific setup, configuration, security,
 delivery semantics, examples, and troubleshooting notes.
@@ -77,7 +78,7 @@ action to broker operations:
 | `PipelineRetry` | Republish with a bounded retry count |
 | `PipelineError` | Publish to the configured dead-letter destination |
 
-Both providers implement at-least-once processing. Handlers and downstream
+All providers implement at-least-once processing. Handlers and downstream
 writes should therefore be idempotent.
 
 ## Choosing a Broker
@@ -86,6 +87,7 @@ Use the broker-specific builder and follow its guide:
 
 - [Configure RabbitMQ](README.rabbitmq.md)
 - [Configure Kafka](README.kafka.md)
+- [Configure Azure Event Hubs](README.azure-event-hubs.md)
 
 Application code can depend on `QueueInterface` after construction, keeping
 most processing logic independent of the selected broker.
@@ -98,7 +100,7 @@ Run the complete test suite:
 go test ./...
 ```
 
-Verify the RabbitMQ-only, non-CGO build:
+Verify the non-CGO build used by RabbitMQ-only applications:
 
 ```bash
 CGO_ENABLED=0 go test ./...
