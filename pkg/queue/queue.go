@@ -42,10 +42,13 @@ func New(opts QueueOptions, client ...QueueInterface) (*Queue, error) {
 	// If no client provided, create default production client
 	var q QueueInterface
 	if len(client) == 0 {
-		// Type assert to RabbitOptions for creating RabbitMQ client
-		if rabbitOpts, ok := opts.(*RabbitOptions); ok {
+		switch queueOpts := opts.(type) {
+		case *RabbitOptions:
+			rabbitOpts := queueOpts
 			q, err = NewRabbitMQ(rabbitOpts)
-		} else {
+		case *KafkaOptions:
+			q, err = NewKafka(queueOpts)
+		default:
 			return nil, fmt.Errorf("unsupported queue options type")
 		}
 	} else {
