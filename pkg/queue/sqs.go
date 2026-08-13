@@ -169,7 +169,11 @@ func (s *SQS) queueURL(ctx context.Context, queueName string) (string, error) {
 }
 
 func (s *SQS) Publish(queueName string, payload []byte) error {
-	return s.publish(queueName, payload, 0)
+	err := s.publish(queueName, payload, 0)
+	if err != nil {
+		_ = s.DisasterRecovery(payload)
+	}
+	return err
 }
 
 func (s *SQS) PublishWithDelay(queueName string, payload []byte, backoff int) {
@@ -183,7 +187,6 @@ func (s *SQS) publish(queueName string, payload []byte, delaySeconds int32) erro
 		return fmt.Errorf("SQS delay must be between 0 and 900 seconds")
 	}
 	if err := s.ensureConnected(); err != nil {
-		_ = s.DisasterRecovery(payload)
 		return err
 	}
 
@@ -191,7 +194,6 @@ func (s *SQS) publish(queueName string, payload []byte, delaySeconds int32) erro
 	defer cancel()
 	queueURL, err := s.queueURL(ctx, queueName)
 	if err != nil {
-		_ = s.DisasterRecovery(payload)
 		return err
 	}
 	client, _ := s.clientAndConsumerURL()
@@ -225,9 +227,6 @@ func (s *SQS) publish(queueName string, payload []byte, delaySeconds int32) erro
 				client, _ = s.clientAndConsumerURL()
 				_, err = client.SendMessage(ctx, input)
 			}
-		}
-		if err != nil {
-			_ = s.DisasterRecovery(payload)
 		}
 		return err
 	}
@@ -414,7 +413,6 @@ func (s *SQS) publishThenDelete(ctx context.Context, message types.Message, queu
 
 func (s *SQS) deadletterAndDelete(ctx context.Context, message types.Message, payload []byte) error {
 	if err := s.AddToDeadletter(payload); err != nil {
-		_ = s.DisasterRecovery(payload)
 		return err
 	}
 	return s.deleteMessage(ctx, message)

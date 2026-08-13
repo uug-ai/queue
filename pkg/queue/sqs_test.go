@@ -135,6 +135,19 @@ func TestSQSFIFOPublish(t *testing.T) {
 	}
 }
 
+func TestSQSPublishFailureInvokesDisasterRecoveryOnce(t *testing.T) {
+	client, _ := newTestSQS(t, types.Message{})
+	recoveryCalls := 0
+	client.SetDisasterRecoveryHandler(func([]byte) error {
+		recoveryCalls++
+		return nil
+	})
+	client.PublishWithDelay("target.fifo", []byte("payload"), 1)
+	if recoveryCalls != 1 {
+		t.Fatalf("disaster recovery calls = %d", recoveryCalls)
+	}
+}
+
 func TestSQSReadMessagesForwardsBeforeDelete(t *testing.T) {
 	message := testSQSMessage(t, models.PipelineEvent{Stages: []string{"analysis", "classify"}}, "1")
 	client, fake := newTestSQS(t, message)

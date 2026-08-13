@@ -82,10 +82,10 @@ the AWS SDK client is required.
 | `SecretAccessKey` | No | Explicit secret key; required with access key |
 | `SessionToken` | No | Session token for temporary explicit credentials |
 | `WaitTimeSeconds` | No | Long-poll duration; defaults to `20`, maximum `20` |
-| `VisibilityTimeout` | No | Initial visibility timeout; defaults to `30` seconds |
-| `MaxNumberOfMessages` | No | Messages per receive; defaults to `10`, maximum `10` |
-| `MaxRetries` | No | Retry count before dead-lettering; defaults to `10` |
-| `MessageGroupID` | No | FIFO message group; defaults to `queue` |
+| `VisibilityTimeout` | No | Initial visibility; defaults to `30` seconds |
+| `MaxNumberOfMessages` | No | Receive batch size; defaults to `10` |
+| `MaxRetries` | No | Retries before dead-lettering; defaults to `10` |
+| `MessageGroupID` | No | FIFO group; defaults to `queue` |
 
 Queue names can also be full SQS queue URLs. This is useful for cross-account
 queues when URL discovery is handled outside the package.
