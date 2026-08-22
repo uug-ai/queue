@@ -50,6 +50,8 @@ func New(opts QueueOptions, client ...QueueInterface) (*Queue, error) {
 			q, err = NewKafka(queueOpts)
 		case *AzureEventHubOptions:
 			q, err = NewAzureEventHub(queueOpts)
+		case *SQSOptions:
+			q, err = NewSQS(queueOpts)
 		default:
 			return nil, fmt.Errorf("unsupported queue options type")
 		}

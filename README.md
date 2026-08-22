@@ -18,6 +18,7 @@ different message brokers.
 | RabbitMQ | `amqp091-go` | [RabbitMQ guide](README.rabbitmq.md) |
 | Kafka | Confluent Kafka Go client | [Kafka guide](README.kafka.md) |
 | Azure Event Hubs | Kafka-compatible endpoint | [Event Hubs guide](README.azure-event-hubs.md) |
+| Amazon SQS | AWS SDK for Go v2 | [SQS guide](README.sqs.md) |
 
 The broker guides contain provider-specific setup, configuration, security,
 delivery semantics, examples, and troubleshooting notes.
@@ -88,6 +89,7 @@ Use the broker-specific builder and follow its guide:
 - [Configure RabbitMQ](README.rabbitmq.md)
 - [Configure Kafka](README.kafka.md)
 - [Configure Azure Event Hubs](README.azure-event-hubs.md)
+- [Configure Amazon SQS](README.sqs.md)
 
 Application code can depend on `QueueInterface` after construction, keeping
 most processing logic independent of the selected broker.
