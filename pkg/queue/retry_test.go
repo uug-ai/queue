@@ -1,7 +1,9 @@
 package queue
 
 import (
+	"errors"
 	"testing"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -67,5 +69,61 @@ func TestRetryCount(t *testing.T) {
 				t.Errorf("retryCount(%v) = %d, want %d", tc.headers, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestRetryOrDeadletterPublishesBeforeReturning(t *testing.T) {
+	rabbit := newTestRabbit(t, 2)
+	payload := []byte(`{"key":"recording.mp4"}`)
+
+	var queueName string
+	var headers amqp.Table
+	err := rabbit.retryOrDeadletter(nil, payload, time.Nanosecond, func(gotQueue string, gotPayload []byte, gotHeaders amqp.Table) error {
+		queueName = gotQueue
+		headers = gotHeaders
+		if string(gotPayload) != string(payload) {
+			t.Fatalf("payload = %s, want %s", gotPayload, payload)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retryOrDeadletter() error = %v", err)
+	}
+	if queueName != "c" {
+		t.Errorf("queue = %q, want consumer queue", queueName)
+	}
+	if got := retryCount(headers); got != 1 {
+		t.Errorf("retry header = %d, want 1", got)
+	}
+}
+
+func TestRetryOrDeadletterReturnsPublishFailure(t *testing.T) {
+	rabbit := newTestRabbit(t, 2)
+	wantErr := errors.New("broker unavailable")
+
+	err := rabbit.retryOrDeadletter(nil, []byte("payload"), time.Nanosecond, func(string, []byte, amqp.Table) error {
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("retryOrDeadletter() error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestRetryOrDeadletterUsesDeadletterAtCap(t *testing.T) {
+	rabbit := newTestRabbit(t, 2)
+
+	var queueName string
+	err := rabbit.retryOrDeadletter(amqp.Table{retryCountHeader: int32(2)}, []byte("payload"), time.Nanosecond, func(gotQueue string, _ []byte, headers amqp.Table) error {
+		queueName = gotQueue
+		if headers != nil {
+			t.Fatalf("deadletter headers = %v, want nil", headers)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retryOrDeadletter() error = %v", err)
+	}
+	if queueName != "c-dlq" {
+		t.Errorf("queue = %q, want deadletter queue", queueName)
 	}
 }
