@@ -139,7 +139,10 @@ pipeline action, and acknowledges the original delivery.
 - `PipelineForward` removes the completed stage and publishes to `RouterQueue`
   when another stage remains.
 - `PipelineError` publishes the handler's event to `DeadletterQueue`.
-- `PipelineRetry` republishes to `ConsumerQueue` after a five-second backoff.
+- `PipelineRetry` waits for the configured backoff and synchronously republishes
+    to `ConsumerQueue`. The original delivery is acknowledged only after that
+    publish succeeds; a publish failure returns from the consumer with the
+    original delivery unacknowledged so reconnect/redelivery can recover it.
 - `PipelineCancel` only acknowledges the delivery.
 
 RabbitMQ retries carry an `x-retry-count` message header. After `MaxRetries`, the

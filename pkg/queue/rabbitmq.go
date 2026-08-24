@@ -597,7 +597,9 @@ func (r *RabbitMQ) ReadMessages(handleMessage models.MessageHandler, handleProme
 				// the attempt count on the message and dead-letters it once the cap is
 				// hit, so a permanently failing payload can never loop the consumer
 				// queue forever.
-				r.retryOrDeadletter(d.Headers, payload, 5)
+				if err := r.retryOrDeadletter(d.Headers, payload, 5*time.Second, r.publishWithReconnect); err != nil {
+					return err
+				}
 			}
 
 			// Always acknowledge messages regardless of sync mode
@@ -765,7 +767,9 @@ func (r *RabbitMQ) ReadRawMessages(handleMessage RawMessageHandler, handlePromet
 				// hit, so a permanently failing payload can never loop the consumer
 				// queue forever (the workflow engine's marker-ingest retry that backed
 				// this queue up).
-				r.retryOrDeadletter(d.Headers, payload, backoff)
+				if err := r.retryOrDeadletter(d.Headers, payload, time.Duration(backoff)*time.Second, r.publishWithReconnect); err != nil {
+					return err
+				}
 			}
 
 			if err := d.Ack(false); err != nil {
@@ -1006,27 +1010,23 @@ func retryCount(headers amqp.Table) int {
 	}
 }
 
-// retryOrDeadletter handles a PipelineRetry. It re-queues the message to the
-// consumer queue after a delay, carrying an incremented x-retry-count, until the
-// count reaches the configured cap; past the cap it parks the payload on the
-// deadletter queue instead of requeuing. This is the hard stop that keeps a
-// permanently failing payload from looping the consumer queue forever — the
-// failure mode that backed the workflows queue up when a marker write kept being
-// rejected and retried without bound.
-func (r *RabbitMQ) retryOrDeadletter(headers amqp.Table, payload []byte, backoff int) {
+// retryOrDeadletter handles a PipelineRetry. It synchronously re-queues the
+// message after a delay, carrying an incremented x-retry-count, until the count
+// reaches the configured cap; past the cap it parks the payload on the
+// deadletter queue instead. The caller acknowledges the original delivery only
+// after this returns nil, so a failed retry publish cannot silently lose it.
+func (r *RabbitMQ) retryOrDeadletter(headers amqp.Table, payload []byte, backoff time.Duration, publish func(string, []byte, amqp.Table) error) error {
 	attempts := retryCount(headers)
 	if attempts >= r.maxRetries() {
-		// Exhausted the retry budget: dead-letter so the message is preserved for
-		// inspection/replay rather than requeued into an unbounded loop.
-		if err := r.AddToDeadletter(payload); err != nil {
-			r.DisasterRecovery(payload)
-		}
-		return
+		return publish(r.options.DeadletterQueue, payload, nil)
 	}
 	if backoff <= 0 {
-		backoff = 5
+		backoff = 5 * time.Second
 	}
-	r.publishWithDelayHeaders(r.options.ConsumerQueue, payload, backoff, amqp.Table{
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
+	<-timer.C
+	return publish(r.options.ConsumerQueue, payload, amqp.Table{
 		retryCountHeader: int32(attempts + 1),
 	})
 }
