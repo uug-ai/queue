@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   # Determine the next version, create the GitHub release and expose the tag.
