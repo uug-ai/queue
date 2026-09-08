@@ -5,8 +5,9 @@
 The RabbitMQ provider uses
 [`github.com/rabbitmq/amqp091-go`](https://github.com/rabbitmq/amqp091-go). It
 creates separate producer and consumer channels, declares quorum queues, applies
-consumer prefetch, reconnects closed connections, and reports unroutable
-publishes.
+consumer prefetch, and reconnects closed connections. Services can explicitly
+opt into persistent publisher confirms and delayed source acknowledgements when
+their delivery guarantees justify the additional broker round trip.
 
 ## Quick Start
 
@@ -62,6 +63,7 @@ methods or channels is required.
 | `AnalysisQueue` | No | Optional analysis destination |
 | `PrefetchCount` | No | Maximum unacknowledged deliveries; defaults to `5` |
 | `MaxRetries` | No | Retry limit before dead-lettering; defaults to `10` |
+| `ConfirmedDelivery` | No | Provisions the confirmed producer used by explicit confirmed methods; defaults to `false` |
 | `Exchange` | No | Compatibility field; the default exchange is used |
 | `Uri` | No | Compatibility field; connection uses host and credentials |
 | `TLS` | No | Enables an `amqps://` connection |
@@ -70,7 +72,7 @@ methods or channels is required.
 
 The builder provides matching setters, including `SetConsumerQueue`,
 `SetDeadletterQueue`, `SetRouterQueue`, `SetHost`, `SetUsername`, `SetPassword`,
-`SetPrefetchCount`, `SetMaxRetries`, and the TLS setters.
+`SetPrefetchCount`, `SetMaxRetries`, `SetConfirmedDelivery`, and the TLS setters.
 
 ### Environment Example
 
@@ -93,12 +95,47 @@ queues. The router, analysis, and arbitrary publish destinations must already
 exist or be declared by their owning consumers.
 
 Publishing uses the default exchange with the destination queue as its routing
-key. Messages are marked mandatory. If no queue is bound to the routing key,
-RabbitMQ returns the message instead of silently dropping it.
+key. `Publish` retains the legacy asynchronous behavior. Mandatory returns are
+reported through `ReturnHandler`, but they can arrive after `Publish` returns.
+
+For stronger delivery guarantees, enable and call the explicit confirmed API:
+
+```go
+options := queue.NewRabbitOptions().
+    SetConsumerQueue("kcloud-export-queue").
+    SetDeadletterQueue("dead-letter-queue").
+    SetHost("rabbitmq.example.com:5672").
+    SetUsername("username").
+    SetPassword("password").
+    SetConfirmedDelivery(true).
+    Build()
+
+rabbit, err := queue.NewRabbitMQ(options)
+if err != nil {
+    log.Fatal(err)
+}
+if err := rabbit.Connect(); err != nil {
+    log.Fatal(err)
+}
+defer rabbit.Close()
+
+if err := rabbit.PublishConfirmed("target-queue", payload); err != nil {
+    log.Fatal(err)
+}
+```
+
+`PublishConfirmed` marks messages persistent and waits up to five seconds for
+RabbitMQ to confirm acceptance. It returns an error for a negative
+acknowledgement, confirmation timeout, closed channel, or mandatory return.
+Confirmed publishes on one client are serialized so returns correlate with
+their confirmation, and reconnect cannot replace that producer mid-publish.
+This synchronous broker round trip can reduce throughput, so enable it per
+service rather than as a blanket dependency upgrade.
 
 Use `SetReturnHandler` on the concrete `RabbitMQ` client to report returned
-messages to metrics or structured logging. Without a handler, returns are logged
-through the standard logger.
+messages to metrics or structured logging. The callback runs asynchronously.
+`PublishConfirmed` also returns the unroutable error synchronously. Without a
+handler, returns are logged through the standard logger.
 
 ```go
 rabbit, err := queue.NewRabbitMQ(options)
@@ -131,9 +168,10 @@ Use `SetTLSInsecureSkipVerify(true)` only in controlled development environments
 
 ## Consumption Semantics
 
-RabbitMQ deliveries use manual acknowledgements. `ReadMessages` decodes each
-payload as `models.PipelineEvent`, invokes the handler, performs the selected
-pipeline action, and acknowledges the original delivery.
+RabbitMQ deliveries use manual acknowledgements. `ReadMessages` retains the
+legacy behavior. `ReadMessagesConfirmed` uses persistent confirmed publishes
+and acknowledges a source delivery only after its transfer is durable. It
+requires `SetConfirmedDelivery(true)`.
 
 - Invalid JSON is sent to the dead-letter queue.
 - `PipelineForward` removes the completed stage and publishes to `RouterQueue`
@@ -144,6 +182,13 @@ pipeline action, and acknowledges the original delivery.
     publish succeeds; a publish failure returns from the consumer with the
     original delivery unacknowledged so reconnect/redelivery can recover it.
 - `PipelineCancel` only acknowledges the delivery.
+
+Under `ReadMessagesConfirmed`, any failed forward, retry, or dead-letter
+transfer is offered to the configured `DisasterRecoveryHandler`. The original
+delivery is acknowledged only after the destination publish or disaster
+recovery succeeds. If both fail (or no recovery handler is configured), the
+library negatively acknowledges with requeue, closes the stale connection, and
+returns the error so a fresh consumer can redeliver it.
 
 RabbitMQ retries carry an `x-retry-count` message header. After `MaxRetries`, the
 payload is parked on `DeadletterQueue` rather than requeued indefinitely.
@@ -158,6 +203,10 @@ The concrete `RabbitMQ` client also supports queues whose payload is not a
 
 - `ReadRawMessages` runs a long-lived raw consumer.
 - `ReadOneRaw` reads at most one message for verification and drain tools.
+- `ReadRawMessagesConfirmed` and `ReadOneRawConfirmed` provide the corresponding
+    confirmed settlement behavior when explicitly enabled.
+
+`RouteMessagesConfirmed` is the confirmed counterpart to `RouteMessages`.
 
 `RawMessageHandler` receives the original bytes and returns a pipeline action,
 an optional forwarding payload, and retry backoff seconds.
@@ -200,5 +249,8 @@ Run RabbitMQ-focused unit tests:
 go test ./pkg/queue -run 'TestRabbit|TestRetry' -v
 ```
 
-The integration test runs only when RabbitMQ connection environment variables
-are provided; otherwise it is skipped.
+The integration suite runs only when `RABBITMQ_HOST`, `RABBITMQ_USERNAME`, and
+`RABBITMQ_PASSWORD` are provided; otherwise it is skipped. In addition to basic
+connectivity, it verifies that confirmed publishing rejects an unroutable queue
+and that an unacknowledged persistent message is redelivered after a forced AMQP
+connection interruption and reconnect.
