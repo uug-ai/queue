@@ -5,8 +5,8 @@
 The RabbitMQ provider uses
 [`github.com/rabbitmq/amqp091-go`](https://github.com/rabbitmq/amqp091-go). It
 creates separate producer and consumer channels, declares quorum queues, applies
-consumer prefetch, reconnects closed connections, and reports unroutable
-publishes.
+consumer prefetch, reconnects closed connections, and uses persistent publisher
+confirms to report accepted, rejected, timed-out, and unroutable publishes.
 
 ## Quick Start
 
@@ -93,12 +93,20 @@ queues. The router, analysis, and arbitrary publish destinations must already
 exist or be declared by their owning consumers.
 
 Publishing uses the default exchange with the destination queue as its routing
-key. Messages are marked mandatory. If no queue is bound to the routing key,
-RabbitMQ returns the message instead of silently dropping it.
+key. Messages are persistent and mandatory. Each producer channel runs in
+confirm mode, and `Publish` waits up to five seconds for RabbitMQ to confirm the
+message. It returns an error for a negative acknowledgement, confirmation
+timeout, closed channel, or mandatory return. A successful return therefore
+means the broker accepted the persistent message into its destination queue.
+
+Publishes on one `RabbitMQ` client are serialized so mandatory returns correlate
+with their confirmation. Reconnect and close operations use the same lock and
+cannot replace the producer while a publish is awaiting confirmation.
 
 Use `SetReturnHandler` on the concrete `RabbitMQ` client to report returned
-messages to metrics or structured logging. Without a handler, returns are logged
-through the standard logger.
+messages to metrics or structured logging. The callback runs asynchronously
+after `Publish` returns the unroutable error. Without a handler, returns are
+logged through the standard logger.
 
 ```go
 rabbit, err := queue.NewRabbitMQ(options)
@@ -144,6 +152,13 @@ pipeline action, and acknowledges the original delivery.
     publish succeeds; a publish failure returns from the consumer with the
     original delivery unacknowledged so reconnect/redelivery can recover it.
 - `PipelineCancel` only acknowledges the delivery.
+
+Any failed forward, retry, or dead-letter transfer is offered to the configured
+`DisasterRecoveryHandler`. The original delivery is acknowledged only after the
+destination publish or disaster recovery succeeds. If both fail (or no recovery
+handler is configured), the library negatively acknowledges with requeue,
+closes the stale connection, and returns the error so a fresh consumer can
+redeliver it.
 
 RabbitMQ retries carry an `x-retry-count` message header. After `MaxRetries`, the
 payload is parked on `DeadletterQueue` rather than requeued indefinitely.
@@ -200,5 +215,8 @@ Run RabbitMQ-focused unit tests:
 go test ./pkg/queue -run 'TestRabbit|TestRetry' -v
 ```
 
-The integration test runs only when RabbitMQ connection environment variables
-are provided; otherwise it is skipped.
+The integration suite runs only when `RABBITMQ_HOST`, `RABBITMQ_USERNAME`, and
+`RABBITMQ_PASSWORD` are provided; otherwise it is skipped. In addition to basic
+connectivity, it verifies that confirmed publishing rejects an unroutable queue
+and that an unacknowledged persistent message is redelivered after a forced AMQP
+connection interruption and reconnect.

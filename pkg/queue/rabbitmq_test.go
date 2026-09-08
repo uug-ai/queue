@@ -6,7 +6,32 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 )
+
+type recordingAcknowledger struct {
+	acks      int
+	nacks     int
+	requeue   bool
+	ackError  error
+	nackError error
+}
+
+func (a *recordingAcknowledger) Ack(_ uint64, _ bool) error {
+	a.acks++
+	return a.ackError
+}
+
+func (a *recordingAcknowledger) Nack(_ uint64, _ bool, requeue bool) error {
+	a.nacks++
+	a.requeue = requeue
+	return a.nackError
+}
+
+func (a *recordingAcknowledger) Reject(_ uint64, _ bool) error {
+	return nil
+}
 
 // TestRabbitOptionsValidation tests the validation of RabbitMQ options
 func TestRabbitOptionsValidation(t *testing.T) {
@@ -447,6 +472,116 @@ func TestRabbitMQIntegration(t *testing.T) {
 		queueName = "test-integration-queue"
 	}
 
+	t.Run("ConfirmedPublishRejectsUnroutableMessage", func(t *testing.T) {
+		testQueue := fmt.Sprintf("%s-confirm-%d", queueName, time.Now().UnixNano())
+		opts := NewRabbitOptions().
+			SetConsumerQueue(testQueue).
+			SetDeadletterQueue(testQueue + "-dlq").
+			SetHost(host).
+			SetUsername(username).
+			SetPassword(password).
+			Build()
+
+		rabbit, err := NewRabbitMQ(opts)
+		if err != nil {
+			t.Fatalf("create RabbitMQ client: %v", err)
+		}
+		if err := rabbit.Connect(); err != nil {
+			t.Fatalf("connect to RabbitMQ: %v", err)
+		}
+		defer rabbit.Close()
+
+		returned := make(chan amqp.Return, 1)
+		rabbit.SetReturnHandler(func(ret amqp.Return) {
+			returned <- ret
+		})
+
+		missingQueue := testQueue + "-missing"
+		if err := rabbit.Publish(missingQueue, []byte(`{"message":"unroutable"}`)); err == nil {
+			t.Fatal("expected an unroutable confirmed publish to fail")
+		}
+		select {
+		case ret := <-returned:
+			if ret.RoutingKey != missingQueue {
+				t.Fatalf("returned routing key = %q, want %q", ret.RoutingKey, missingQueue)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for the mandatory return handler")
+		}
+	})
+
+	t.Run("ConnectionInterruptionReconnectsAndRedelivers", func(t *testing.T) {
+		testQueue := fmt.Sprintf("%s-reconnect-%d", queueName, time.Now().UnixNano())
+		opts := NewRabbitOptions().
+			SetConsumerQueue(testQueue).
+			SetDeadletterQueue(testQueue + "-dlq").
+			SetHost(host).
+			SetUsername(username).
+			SetPassword(password).
+			Build()
+
+		rabbit, err := NewRabbitMQ(opts)
+		if err != nil {
+			t.Fatalf("create RabbitMQ client: %v", err)
+		}
+		if err := rabbit.Connect(); err != nil {
+			t.Fatalf("connect to RabbitMQ: %v", err)
+		}
+		defer rabbit.Close()
+
+		payload := []byte(`{"message":"redeliver"}`)
+		if err := rabbit.Publish(testQueue, payload); err != nil {
+			t.Fatalf("publish test message: %v", err)
+		}
+
+		delivery, ok, err := rabbit.currentConsumer().Get(testQueue, false)
+		if err != nil {
+			t.Fatalf("get test message: %v", err)
+		}
+		if !ok {
+			t.Fatal("expected the published message")
+		}
+		if delivery.DeliveryMode != amqp.Persistent {
+			t.Fatalf("delivery mode = %d, want persistent (%d)", delivery.DeliveryMode, amqp.Persistent)
+		}
+
+		oldConnection := rabbit.Connection
+		if err := oldConnection.Close(); err != nil {
+			t.Fatalf("interrupt RabbitMQ connection: %v", err)
+		}
+		if err := rabbit.ensureConnected(); err != nil {
+			t.Fatalf("reconnect after interruption: %v", err)
+		}
+		if rabbit.Connection == oldConnection {
+			t.Fatal("expected reconnect to replace the interrupted connection")
+		}
+
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			delivery, ok, err = rabbit.currentConsumer().Get(testQueue, false)
+			if err != nil {
+				t.Fatalf("get redelivered message: %v", err)
+			}
+			if ok {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for unacked message redelivery")
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+
+		if string(delivery.Body) != string(payload) {
+			t.Fatalf("redelivered body = %q, want %q", delivery.Body, payload)
+		}
+		if !delivery.Redelivered {
+			t.Fatal("expected interrupted unacked delivery to be marked redelivered")
+		}
+		if err := delivery.Ack(false); err != nil {
+			t.Fatalf("ack redelivered message: %v", err)
+		}
+	})
+
 	t.Run("ConnectToRealRabbitMQ", func(t *testing.T) {
 		// Build RabbitMQ options from environment variables
 		opts := NewRabbitOptions().
@@ -680,6 +815,49 @@ func TestRabbitMQNeedsReconnectWithoutResources(t *testing.T) {
 	if !rabbit.needsReconnect() {
 		t.Fatal("expected reconnect to be required when connection resources are missing")
 	}
+}
+
+func TestSettleTransferredDelivery(t *testing.T) {
+	t.Run("AcknowledgesAfterSuccessfulTransfer", func(t *testing.T) {
+		acknowledger := &recordingAcknowledger{}
+		delivery := amqp.Delivery{Acknowledger: acknowledger, DeliveryTag: 1}
+
+		err := (&RabbitMQ{}).settleTransferredDelivery(delivery, func() error { return nil })
+		if err != nil {
+			t.Fatalf("settle successful transfer: %v", err)
+		}
+		if acknowledger.acks != 1 || acknowledger.nacks != 0 {
+			t.Fatalf("acks = %d, nacks = %d; want one ack and no nacks", acknowledger.acks, acknowledger.nacks)
+		}
+	})
+
+	t.Run("RequeuesAfterFailedTransfer", func(t *testing.T) {
+		acknowledger := &recordingAcknowledger{}
+		delivery := amqp.Delivery{Acknowledger: acknowledger, DeliveryTag: 1}
+		transferError := errors.New("destination unavailable")
+
+		err := (&RabbitMQ{}).settleTransferredDelivery(delivery, func() error { return transferError })
+		if !errors.Is(err, transferError) {
+			t.Fatalf("settle error = %v, want %v", err, transferError)
+		}
+		if acknowledger.acks != 0 || acknowledger.nacks != 1 || !acknowledger.requeue {
+			t.Fatalf("acks = %d, nacks = %d, requeue = %t; want no ack and one requeue nack", acknowledger.acks, acknowledger.nacks, acknowledger.requeue)
+		}
+	})
+
+	t.Run("ReturnsAcknowledgementFailure", func(t *testing.T) {
+		ackError := errors.New("consumer channel closed")
+		acknowledger := &recordingAcknowledger{ackError: ackError}
+		delivery := amqp.Delivery{Acknowledger: acknowledger, DeliveryTag: 1}
+
+		err := (&RabbitMQ{}).settleTransferredDelivery(delivery, func() error { return nil })
+		if !errors.Is(err, ackError) {
+			t.Fatalf("settle error = %v, want %v", err, ackError)
+		}
+		if acknowledger.acks != 1 || acknowledger.nacks != 0 {
+			t.Fatalf("acks = %d, nacks = %d; want one attempted ack and no nacks", acknowledger.acks, acknowledger.nacks)
+		}
+	})
 }
 
 // TestDisasterRecovery tests the DisasterRecovery function
