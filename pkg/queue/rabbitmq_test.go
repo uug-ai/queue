@@ -319,6 +319,18 @@ func TestRabbitOptionsBuilder(t *testing.T) {
 			t.Errorf("expected Exchange to be empty, got '%s'", opts.Exchange)
 		}
 	})
+
+	t.Run("ConfirmedDeliveryIsOptIn", func(t *testing.T) {
+		disabled := NewRabbitOptions().Build()
+		if disabled.ConfirmedDelivery {
+			t.Fatal("expected confirmed delivery to be disabled by default")
+		}
+
+		enabled := NewRabbitOptions().SetConfirmedDelivery(true).Build()
+		if !enabled.ConfirmedDelivery {
+			t.Fatal("expected SetConfirmedDelivery to enable confirmed delivery")
+		}
+	})
 }
 
 // TestWorkflowsQueueAliases verifies the workflow-oriented builder aliases set
@@ -480,6 +492,7 @@ func TestRabbitMQIntegration(t *testing.T) {
 			SetHost(host).
 			SetUsername(username).
 			SetPassword(password).
+			SetConfirmedDelivery(true).
 			Build()
 
 		rabbit, err := NewRabbitMQ(opts)
@@ -497,7 +510,7 @@ func TestRabbitMQIntegration(t *testing.T) {
 		})
 
 		missingQueue := testQueue + "-missing"
-		if err := rabbit.Publish(missingQueue, []byte(`{"message":"unroutable"}`)); err == nil {
+		if err := rabbit.PublishConfirmed(missingQueue, []byte(`{"message":"unroutable"}`)); err == nil {
 			t.Fatal("expected an unroutable confirmed publish to fail")
 		}
 		select {
@@ -518,6 +531,7 @@ func TestRabbitMQIntegration(t *testing.T) {
 			SetHost(host).
 			SetUsername(username).
 			SetPassword(password).
+			SetConfirmedDelivery(true).
 			Build()
 
 		rabbit, err := NewRabbitMQ(opts)
@@ -530,7 +544,7 @@ func TestRabbitMQIntegration(t *testing.T) {
 		defer rabbit.Close()
 
 		payload := []byte(`{"message":"redeliver"}`)
-		if err := rabbit.Publish(testQueue, payload); err != nil {
+		if err := rabbit.PublishConfirmed(testQueue, payload); err != nil {
 			t.Fatalf("publish test message: %v", err)
 		}
 
@@ -814,6 +828,26 @@ func TestRabbitMQNeedsReconnectWithoutResources(t *testing.T) {
 
 	if !rabbit.needsReconnect() {
 		t.Fatal("expected reconnect to be required when connection resources are missing")
+	}
+}
+
+func TestConfirmedDeliveryRequiresOptIn(t *testing.T) {
+	rabbit := &RabbitMQ{options: &RabbitOptions{}}
+
+	if err := rabbit.PublishConfirmed("target", []byte("payload")); err == nil {
+		t.Fatal("expected PublishConfirmed to require confirmed delivery")
+	}
+	if err := rabbit.ReadMessagesConfirmed(nil, nil); err == nil {
+		t.Fatal("expected ReadMessagesConfirmed to require confirmed delivery")
+	}
+	if err := rabbit.ReadRawMessagesConfirmed(nil, nil); err == nil {
+		t.Fatal("expected ReadRawMessagesConfirmed to require confirmed delivery")
+	}
+	if err := rabbit.RouteMessagesConfirmed(nil, nil); err == nil {
+		t.Fatal("expected RouteMessagesConfirmed to require confirmed delivery")
+	}
+	if _, err := rabbit.ReadOneRawConfirmed(nil); err == nil {
+		t.Fatal("expected ReadOneRawConfirmed to require confirmed delivery")
 	}
 }
 

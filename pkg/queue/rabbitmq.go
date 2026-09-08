@@ -25,21 +25,22 @@ type DisasterRecoveryHandler func([]byte) error
 // exchange the routing key is the target queue name, so a return means the
 // producer is publishing to a queue that does not exist — typically a
 // producer/consumer queue-name drift that is otherwise completely silent. The
-// handler runs asynchronously after Publish has returned the routing error.
+// handler runs asynchronously for both legacy and confirmed publishes.
 type ReturnHandler func(amqp.Return)
 
 // RabbitOptions holds the configuration for RabbitMQ
 type RabbitOptions struct {
-	ConsumerQueue   string `validate:"required"` // Queue from which to consume messages, one consumer per queue
-	RouterQueue     string // Router queue; only used — and only needs to be set — when a handler returns the Forward action. Stage workers that never forward may leave it unset.
-	DeadletterQueue string `validate:"required"` // When something goes wrong, messages are sent here
-	AnalysisQueue   string // Queue for analysis messages
-	Uri             string
-	Host            string `validate:"required"`
-	Username        string `validate:"required"`
-	Password        string `validate:"required"`
-	PrefetchCount   int
-	Exchange        string
+	ConsumerQueue     string `validate:"required"` // Queue from which to consume messages, one consumer per queue
+	RouterQueue       string // Router queue; only used — and only needs to be set — when a handler returns the Forward action. Stage workers that never forward may leave it unset.
+	DeadletterQueue   string `validate:"required"` // When something goes wrong, messages are sent here
+	AnalysisQueue     string // Queue for analysis messages
+	Uri               string
+	Host              string `validate:"required"`
+	Username          string `validate:"required"`
+	Password          string `validate:"required"`
+	PrefetchCount     int
+	Exchange          string
+	ConfirmedDelivery bool
 
 	// MaxRetries caps how many times a PipelineRetry re-queues a message before
 	// it is parked on the deadletter queue; zero selects defaultMaxRetries. It is
@@ -158,6 +159,13 @@ func (b *RabbitOptionsBuilder) SetMaxRetries(maxRetries int) *RabbitOptionsBuild
 	return b
 }
 
+// SetConfirmedDelivery provisions the dedicated publisher-confirm channel used
+// by PublishConfirmed and the confirmed consumer methods.
+func (b *RabbitOptionsBuilder) SetConfirmedDelivery(enabled bool) *RabbitOptionsBuilder {
+	b.options.ConfirmedDelivery = enabled
+	return b
+}
+
 // SetTLS enables TLS for the connection
 func (b *RabbitOptionsBuilder) SetTLS(enabled bool) *RabbitOptionsBuilder {
 	b.options.TLS = enabled
@@ -188,7 +196,8 @@ type RabbitMQ struct {
 	Connection              *amqp.Connection // The underlying RabbitMQ connection
 	Consumer                *amqp.Channel    // Channel for consuming messages
 	Producer                *amqp.Channel    // Channel for producing messages
-	producerReturns         <-chan amqp.Return
+	confirmedProducer       *amqp.Channel
+	confirmedReturns        <-chan amqp.Return
 	disasterRecoveryHandler DisasterRecoveryHandler // Optional handler for failed messages
 	returnHandler           ReturnHandler           // Optional handler for unroutable (mandatory-returned) messages
 	mu                      sync.Mutex
@@ -278,16 +287,33 @@ func (r *RabbitMQ) connectLocked() error {
 		_ = connection.Close()
 		return err
 	}
-	returns := producer.NotifyReturn(make(chan amqp.Return, 1))
-	if err := producer.Confirm(false); err != nil {
-		_ = producer.Close()
-		_ = connection.Close()
-		return err
+	returns := producer.NotifyReturn(make(chan amqp.Return, 16))
+	go r.watchReturns(returns)
+
+	var confirmedProducer *amqp.Channel
+	var confirmedReturns <-chan amqp.Return
+	if r.options.ConfirmedDelivery {
+		confirmedProducer, err = connection.Channel()
+		if err != nil {
+			_ = producer.Close()
+			_ = connection.Close()
+			return err
+		}
+		confirmedReturns = confirmedProducer.NotifyReturn(make(chan amqp.Return, 1))
+		if err := confirmedProducer.Confirm(false); err != nil {
+			_ = confirmedProducer.Close()
+			_ = producer.Close()
+			_ = connection.Close()
+			return err
+		}
 	}
 
 	// Create channel for consuming, receiving messages.
 	consumer, err := connection.Channel()
 	if err != nil {
+		if confirmedProducer != nil {
+			_ = confirmedProducer.Close()
+		}
 		_ = producer.Close()
 		_ = connection.Close()
 		return err
@@ -296,6 +322,9 @@ func (r *RabbitMQ) connectLocked() error {
 	err = consumer.Qos(prefetchCount, 0, false)
 	if err != nil {
 		_ = consumer.Close()
+		if confirmedProducer != nil {
+			_ = confirmedProducer.Close()
+		}
 		_ = producer.Close()
 		_ = connection.Close()
 		return err
@@ -305,6 +334,9 @@ func (r *RabbitMQ) connectLocked() error {
 	err = r.declareQueue(consumer)
 	if err != nil {
 		_ = consumer.Close()
+		if confirmedProducer != nil {
+			_ = confirmedProducer.Close()
+		}
 		_ = producer.Close()
 		_ = connection.Close()
 		return err
@@ -313,13 +345,15 @@ func (r *RabbitMQ) connectLocked() error {
 	oldConnection := r.Connection
 	oldConsumer := r.Consumer
 	oldProducer := r.Producer
+	oldConfirmedProducer := r.confirmedProducer
 
 	r.Connection = connection
 	r.Consumer = consumer
 	r.Producer = producer
-	r.producerReturns = returns
+	r.confirmedProducer = confirmedProducer
+	r.confirmedReturns = confirmedReturns
 
-	r.closeResources(oldConsumer, oldProducer, oldConnection)
+	r.closeResources(oldConsumer, oldProducer, oldConfirmedProducer, oldConnection)
 
 	return nil
 }
@@ -393,6 +427,13 @@ func (r *RabbitMQ) buildTLSConfig() (*tls.Config, error) {
 }
 
 func (r *RabbitMQ) ensureConnected() error {
+	r.mu.Lock()
+	if !r.needsReconnectLocked() {
+		r.mu.Unlock()
+		return nil
+	}
+	r.mu.Unlock()
+
 	r.publishMu.Lock()
 	defer r.publishMu.Unlock()
 
@@ -425,6 +466,9 @@ func (r *RabbitMQ) needsReconnectLocked() bool {
 	if r.Producer == nil || r.Producer.IsClosed() {
 		return true
 	}
+	if r.options.ConfirmedDelivery && (r.confirmedProducer == nil || r.confirmedProducer.IsClosed()) {
+		return true
+	}
 
 	return false
 }
@@ -436,19 +480,29 @@ func (r *RabbitMQ) currentConsumer() *amqp.Channel {
 	return r.Consumer
 }
 
-func (r *RabbitMQ) currentPublisher() (*amqp.Channel, <-chan amqp.Return) {
+func (r *RabbitMQ) currentProducer() *amqp.Channel {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	return r.Producer, r.producerReturns
+	return r.Producer
 }
 
-func (r *RabbitMQ) closeResources(consumer, producer *amqp.Channel, connection *amqp.Connection) {
+func (r *RabbitMQ) currentConfirmedPublisher() (*amqp.Channel, <-chan amqp.Return) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.confirmedProducer, r.confirmedReturns
+}
+
+func (r *RabbitMQ) closeResources(consumer, producer, confirmedProducer *amqp.Channel, connection *amqp.Connection) {
 	if consumer != nil {
 		_ = consumer.Close()
 	}
 	if producer != nil {
 		_ = producer.Close()
+	}
+	if confirmedProducer != nil {
+		_ = confirmedProducer.Close()
 	}
 	if connection != nil {
 		_ = connection.Close()
@@ -462,6 +516,12 @@ func (r *RabbitMQ) reportReturn(ret amqp.Return) {
 	}
 	log.Printf("queue: message returned as unroutable (no queue bound to routing key %q on exchange %q): replyCode=%d replyText=%q — likely a producer/consumer queue-name drift",
 		ret.RoutingKey, ret.Exchange, ret.ReplyCode, ret.ReplyText)
+}
+
+func (r *RabbitMQ) watchReturns(returns <-chan amqp.Return) {
+	for ret := range returns {
+		r.reportReturn(ret)
+	}
 }
 
 func isClosedError(err error) bool {
@@ -491,6 +551,27 @@ func (r *RabbitMQ) settleTransferredDelivery(delivery amqp.Delivery, transfer fu
 	return nil
 }
 
+func (r *RabbitMQ) requireConfirmedDelivery() error {
+	if !r.options.ConfirmedDelivery {
+		return fmt.Errorf("confirmed RabbitMQ delivery is not enabled")
+	}
+	return nil
+}
+
+func (r *RabbitMQ) deadletterAndSettle(delivery amqp.Delivery, payload []byte, confirmed bool) error {
+	if confirmed {
+		return r.settleTransferredDelivery(delivery, func() error {
+			return r.deadletterOrRecover(payload)
+		})
+	}
+
+	if err := r.AddToDeadletter(payload); err != nil {
+		_ = r.DisasterRecovery(payload)
+	}
+	_ = delivery.Ack(false)
+	return nil
+}
+
 // ReadMessages reads messages from the RabbitMQ queue, processes them using the provided handler,
 // and reports metrics using the provided Prometheus handler. It will then take action based on the handler's result.
 // Forwards, cancels, retries or sends to deadletter as needed.
@@ -500,6 +581,24 @@ func (r *RabbitMQ) settleTransferredDelivery(delivery amqp.Delivery, transfer fu
 // - handlePrometheus: function to handle metrics reporting
 // - args: additional arguments to pass to the message handler
 func (r *RabbitMQ) ReadMessages(handleMessage models.MessageHandler, handlePrometheus models.PrometheusHandler, args ...any) error {
+	return r.readMessages(false, handleMessage, handlePrometheus, args...)
+}
+
+// ReadMessagesConfirmed processes PipelineEvents with confirmed forwarding and
+// only acknowledges each source delivery after its transfer is durable.
+func (r *RabbitMQ) ReadMessagesConfirmed(handleMessage models.MessageHandler, handlePrometheus models.PrometheusHandler, args ...any) error {
+	if err := r.requireConfirmedDelivery(); err != nil {
+		return err
+	}
+	return r.readMessages(true, handleMessage, handlePrometheus, args...)
+}
+
+func (r *RabbitMQ) readMessages(confirmed bool, handleMessage models.MessageHandler, handlePrometheus models.PrometheusHandler, args ...any) error {
+	publish := r.publishLegacyWithRecovery
+	if confirmed {
+		publish = r.publishConfirmedWithReconnect
+	}
+
 	for {
 		if err := r.ensureConnected(); err != nil {
 			return err
@@ -538,9 +637,7 @@ func (r *RabbitMQ) ReadMessages(handleMessage models.MessageHandler, handleProme
 			var pipelineEvent models.PipelineEvent
 			err = json.Unmarshal(payload, &pipelineEvent)
 			if err != nil {
-				if err := r.settleTransferredDelivery(d, func() error {
-					return r.deadletterOrRecover(payload)
-				}); err != nil {
+				if err := r.deadletterAndSettle(d, payload, confirmed); err != nil {
 					return err
 				}
 				continue
@@ -567,19 +664,15 @@ func (r *RabbitMQ) ReadMessages(handleMessage models.MessageHandler, handleProme
 				// Marshal updated event
 				pipelineEventPayload, err := json.Marshal(pipelineEvent)
 				if err != nil {
-					if err := r.settleTransferredDelivery(d, func() error {
-						return r.deadletterOrRecover(payload)
-					}); err != nil {
+					if err := r.deadletterAndSettle(d, payload, confirmed); err != nil {
 						return err
 					}
 					continue
 				}
 				topic := r.options.RouterQueue
-				err = r.publishWithReconnect(topic, pipelineEventPayload, nil)
+				err = publish(topic, pipelineEventPayload, nil)
 				if err != nil {
-					if err := r.settleTransferredDelivery(d, func() error {
-						return r.deadletterOrRecover(payload)
-					}); err != nil {
+					if err := r.deadletterAndSettle(d, payload, confirmed); err != nil {
 						return err
 					}
 					continue
@@ -588,19 +681,23 @@ func (r *RabbitMQ) ReadMessages(handleMessage models.MessageHandler, handleProme
 				// Send to deadletter queue
 				pipelineEventPayload, err := json.Marshal(pipelineEvent)
 				if err != nil {
-					if err := r.settleTransferredDelivery(d, func() error {
-						return r.deadletterOrRecover(payload)
-					}); err != nil {
+					if err := r.deadletterAndSettle(d, payload, confirmed); err != nil {
 						return err
 					}
 					continue
 				}
-				if err := r.settleTransferredDelivery(d, func() error {
-					return r.deadletterOrRecover(pipelineEventPayload)
-				}); err != nil {
-					return err
+				if confirmed {
+					if err := r.deadletterAndSettle(d, pipelineEventPayload, true); err != nil {
+						return err
+					}
+					continue
 				}
-				continue
+				if err := publish(r.options.DeadletterQueue, pipelineEventPayload, nil); err != nil {
+					if err := r.deadletterAndSettle(d, payload, false); err != nil {
+						return err
+					}
+					continue
+				}
 			case models.PipelineCancel:
 				// Nothing to do, just acknowledge, message will be removed from the queue.
 			case models.PipelineRetry:
@@ -608,19 +705,28 @@ func (r *RabbitMQ) ReadMessages(handleMessage models.MessageHandler, handleProme
 				// the attempt count on the message and dead-letters it once the cap is
 				// hit, so a permanently failing payload can never loop the consumer
 				// queue forever.
-				if err := r.settleTransferredDelivery(d, func() error {
-					return r.retryOrDeadletter(d.Headers, payload, 5*time.Second, r.publishWithReconnect)
-				}); err != nil {
+				if confirmed {
+					if err := r.settleTransferredDelivery(d, func() error {
+						return r.retryOrDeadletter(d.Headers, payload, 5*time.Second, publish)
+					}); err != nil {
+						return err
+					}
+					continue
+				}
+				if err := r.retryOrDeadletter(d.Headers, payload, 5*time.Second, publish); err != nil {
 					return err
 				}
-				continue
 			}
 
 			// Always acknowledge messages regardless of sync mode
 			err = d.Ack(false)
 			if err != nil {
-				r.Close()
-				return err
+				if confirmed {
+					r.Close()
+					return err
+				}
+				_ = r.DisasterRecovery(payload)
+				continue
 			}
 
 			// Chrono end
@@ -654,6 +760,18 @@ func (r *RabbitMQ) ReadMessages(handleMessage models.MessageHandler, handleProme
 // failure is reported. The handler's replacement payload is ignored; this never
 // publishes onward.
 func (r *RabbitMQ) ReadOneRaw(handleMessage RawMessageHandler, args ...any) (bool, error) {
+	return r.readOneRaw(false, handleMessage, args...)
+}
+
+// ReadOneRawConfirmed is ReadOneRaw with confirmed dead-letter settlement.
+func (r *RabbitMQ) ReadOneRawConfirmed(handleMessage RawMessageHandler, args ...any) (bool, error) {
+	if err := r.requireConfirmedDelivery(); err != nil {
+		return false, err
+	}
+	return r.readOneRaw(true, handleMessage, args...)
+}
+
+func (r *RabbitMQ) readOneRaw(confirmed bool, handleMessage RawMessageHandler, args ...any) (bool, error) {
 	if err := r.ensureConnected(); err != nil {
 		return false, err
 	}
@@ -675,12 +793,18 @@ func (r *RabbitMQ) ReadOneRaw(handleMessage RawMessageHandler, args ...any) (boo
 	case models.PipelineCancel:
 		return true, d.Ack(false)
 	case models.PipelineError:
-		if err := r.settleTransferredDelivery(d, func() error {
-			return r.deadletterOrRecover(d.Body)
-		}); err != nil {
-			return true, err
+		if confirmed {
+			if err := r.deadletterAndSettle(d, d.Body, true); err != nil {
+				return true, err
+			}
+			return true, nil
 		}
-		return true, nil
+		if err := r.Publish(r.options.DeadletterQueue, d.Body); err != nil {
+			if dlErr := r.AddToDeadletter(d.Body); dlErr != nil {
+				_ = r.DisasterRecovery(d.Body)
+			}
+		}
+		return true, d.Ack(false)
 	default:
 		// Retry/Forward/unknown: requeue, leaving the queue intact.
 		return true, d.Nack(false, true)
@@ -705,6 +829,24 @@ type RawMessageHandler func(payload []byte, args ...any) (models.PipelineAction,
 // cancels). The connection, ack, deadletter and reconnect handling mirror
 // ReadMessages so behaviour is identical apart from the message shape.
 func (r *RabbitMQ) ReadRawMessages(handleMessage RawMessageHandler, handlePrometheus models.PrometheusHandler, args ...any) error {
+	return r.readRawMessages(false, handleMessage, handlePrometheus, args...)
+}
+
+// ReadRawMessagesConfirmed processes raw deliveries with confirmed forwarding
+// and only acknowledges each source delivery after its transfer is durable.
+func (r *RabbitMQ) ReadRawMessagesConfirmed(handleMessage RawMessageHandler, handlePrometheus models.PrometheusHandler, args ...any) error {
+	if err := r.requireConfirmedDelivery(); err != nil {
+		return err
+	}
+	return r.readRawMessages(true, handleMessage, handlePrometheus, args...)
+}
+
+func (r *RabbitMQ) readRawMessages(confirmed bool, handleMessage RawMessageHandler, handlePrometheus models.PrometheusHandler, args ...any) error {
+	publish := r.publishLegacyWithRecovery
+	if confirmed {
+		publish = r.publishConfirmedWithReconnect
+	}
+
 	for {
 		if err := r.ensureConnected(); err != nil {
 			return err
@@ -744,9 +886,16 @@ func (r *RabbitMQ) ReadRawMessages(handleMessage RawMessageHandler, handlePromet
 				// with no router queue as a misconfiguration and dead-letter the
 				// message rather than publishing to an empty queue name.
 				if r.options.RouterQueue == "" {
-					if err := r.settleTransferredDelivery(d, func() error {
-						return r.deadletterOrRecover(payload)
-					}); err != nil {
+					if !confirmed {
+						if err := r.Publish(r.options.DeadletterQueue, payload); err != nil {
+							if dlErr := r.AddToDeadletter(payload); dlErr != nil {
+								_ = r.DisasterRecovery(payload)
+							}
+						}
+						_ = d.Ack(false)
+						continue
+					}
+					if err := r.deadletterAndSettle(d, payload, confirmed); err != nil {
 						return err
 					}
 					continue
@@ -755,18 +904,24 @@ func (r *RabbitMQ) ReadRawMessages(handleMessage RawMessageHandler, handlePromet
 				if forwardPayload == nil {
 					forwardPayload = payload
 				}
-				if err := r.publishWithReconnect(r.options.RouterQueue, forwardPayload, nil); err != nil {
-					if err := r.settleTransferredDelivery(d, func() error {
-						return r.deadletterOrRecover(payload)
-					}); err != nil {
+				if err := publish(r.options.RouterQueue, forwardPayload, nil); err != nil {
+					if err := r.deadletterAndSettle(d, payload, confirmed); err != nil {
 						return err
 					}
 					continue
 				}
 			case models.PipelineError:
-				if err := r.settleTransferredDelivery(d, func() error {
-					return r.deadletterOrRecover(payload)
-				}); err != nil {
+				if !confirmed {
+					if err := r.Publish(r.options.DeadletterQueue, payload); err != nil {
+						if dlErr := r.AddToDeadletter(payload); dlErr != nil {
+							_ = r.DisasterRecovery(payload)
+						}
+						_ = d.Ack(false)
+						continue
+					}
+					break
+				}
+				if err := r.deadletterAndSettle(d, payload, confirmed); err != nil {
 					return err
 				}
 				continue
@@ -778,17 +933,26 @@ func (r *RabbitMQ) ReadRawMessages(handleMessage RawMessageHandler, handlePromet
 				// hit, so a permanently failing payload can never loop the consumer
 				// queue forever (the workflow engine's marker-ingest retry that backed
 				// this queue up).
-				if err := r.settleTransferredDelivery(d, func() error {
-					return r.retryOrDeadletter(d.Headers, payload, time.Duration(backoff)*time.Second, r.publishWithReconnect)
-				}); err != nil {
+				if confirmed {
+					if err := r.settleTransferredDelivery(d, func() error {
+						return r.retryOrDeadletter(d.Headers, payload, time.Duration(backoff)*time.Second, publish)
+					}); err != nil {
+						return err
+					}
+					continue
+				}
+				if err := r.retryOrDeadletter(d.Headers, payload, time.Duration(backoff)*time.Second, publish); err != nil {
 					return err
 				}
-				continue
 			}
 
 			if err := d.Ack(false); err != nil {
-				r.Close()
-				return err
+				if confirmed {
+					r.Close()
+					return err
+				}
+				_ = r.DisasterRecovery(payload)
+				continue
 			}
 
 			processingTime := time.Since(startTime)
@@ -808,6 +972,24 @@ func (r *RabbitMQ) ReadRawMessages(handleMessage RawMessageHandler, handlePromet
 }
 
 func (r *RabbitMQ) RouteMessages(handleMessage models.MessageHandler, handlePrometheus models.PrometheusHandler, args ...any) error {
+	return r.routeMessages(false, handleMessage, handlePrometheus, args...)
+}
+
+// RouteMessagesConfirmed routes PipelineEvents with confirmed publishing and
+// only acknowledges each source delivery after its transfer is durable.
+func (r *RabbitMQ) RouteMessagesConfirmed(handleMessage models.MessageHandler, handlePrometheus models.PrometheusHandler, args ...any) error {
+	if err := r.requireConfirmedDelivery(); err != nil {
+		return err
+	}
+	return r.routeMessages(true, handleMessage, handlePrometheus, args...)
+}
+
+func (r *RabbitMQ) routeMessages(confirmed bool, handleMessage models.MessageHandler, handlePrometheus models.PrometheusHandler, args ...any) error {
+	publish := r.publishLegacyWithRecovery
+	if confirmed {
+		publish = r.publishConfirmedWithReconnect
+	}
+
 	for {
 		if err := r.ensureConnected(); err != nil {
 			return err
@@ -846,9 +1028,7 @@ func (r *RabbitMQ) RouteMessages(handleMessage models.MessageHandler, handleProm
 			var pipelineEvent models.PipelineEvent
 			err = json.Unmarshal(payload, &pipelineEvent)
 			if err != nil {
-				if err := r.settleTransferredDelivery(d, func() error {
-					return r.deadletterOrRecover(payload)
-				}); err != nil {
+				if err := r.deadletterAndSettle(d, payload, confirmed); err != nil {
 					return err
 				}
 				continue
@@ -857,11 +1037,9 @@ func (r *RabbitMQ) RouteMessages(handleMessage models.MessageHandler, handleProm
 			if len(pipelineEvent.Stages) > 0 {
 				nextQueue := pipelineEvent.Stages[0]
 				nextQueue = r.formatQueueName(nextQueue) // Apply legacy naming convention, we will remove this later
-				err = r.publishWithReconnect(nextQueue, payload, nil)
+				err = publish(nextQueue, payload, nil)
 				if err != nil {
-					if err := r.settleTransferredDelivery(d, func() error {
-						return r.deadletterOrRecover(payload)
-					}); err != nil {
+					if err := r.deadletterAndSettle(d, payload, confirmed); err != nil {
 						return err
 					}
 					continue
@@ -871,8 +1049,12 @@ func (r *RabbitMQ) RouteMessages(handleMessage models.MessageHandler, handleProm
 			// Always acknowledge messages regardless of sync mode
 			err = d.Ack(false)
 			if err != nil {
-				r.Close()
-				return err
+				if confirmed {
+					r.Close()
+					return err
+				}
+				_ = r.DisasterRecovery(payload)
+				continue
 			}
 
 			// Chrono end
@@ -903,14 +1085,16 @@ func (r *RabbitMQ) Close() {
 	r.mu.Lock()
 	consumer := r.Consumer
 	producer := r.Producer
+	confirmedProducer := r.confirmedProducer
 	connection := r.Connection
 	r.Consumer = nil
 	r.Producer = nil
-	r.producerReturns = nil
+	r.confirmedProducer = nil
+	r.confirmedReturns = nil
 	r.Connection = nil
 	r.mu.Unlock()
 
-	r.closeResources(consumer, producer, connection)
+	r.closeResources(consumer, producer, confirmedProducer, connection)
 }
 
 // formatQueueName applies legacy naming convention to queue names
@@ -921,7 +1105,16 @@ func (r *RabbitMQ) formatQueueName(queueName string) string {
 
 // Publish sends a message immediately to the specified RabbitMQ queue
 func (r *RabbitMQ) Publish(queueName string, payload []byte) error {
-	err := r.publishWithReconnect(queueName, payload, nil)
+	return r.publishLegacyWithRecovery(queueName, payload, nil)
+}
+
+// PublishConfirmed publishes a persistent message and waits for RabbitMQ to
+// confirm that it accepted the message into the destination queue.
+func (r *RabbitMQ) PublishConfirmed(queueName string, payload []byte) error {
+	if err := r.requireConfirmedDelivery(); err != nil {
+		return err
+	}
+	err := r.publishConfirmedWithReconnect(queueName, payload, nil)
 	if err == nil {
 		return nil
 	}
@@ -931,29 +1124,66 @@ func (r *RabbitMQ) Publish(queueName string, payload []byte) error {
 	return err
 }
 
-// publishWithReconnect publishes payload (optionally carrying headers) and, on a
-// closed/stale channel, reconnects once and retries. It is the shared body
-// behind Publish and the delayed retry path: headers is nil for an ordinary
-// publish and carries the retry counter when a message is re-queued.
-func (r *RabbitMQ) publishWithReconnect(queueName string, payload []byte, headers amqp.Table) error {
+func (r *RabbitMQ) publishLegacyWithReconnect(queueName string, payload []byte, headers amqp.Table) error {
 	if err := r.ensureConnected(); err != nil {
 		return err
 	}
 
-	err := r.publish(queueName, payload, headers)
+	err := r.publishLegacy(queueName, payload, headers)
 	if err != nil && (r.needsReconnect() || isClosedError(err)) {
 		if reconnectErr := r.Reconnect(); reconnectErr == nil {
-			err = r.publish(queueName, payload, headers)
+			err = r.publishLegacy(queueName, payload, headers)
 		}
 	}
 	return err
 }
 
-func (r *RabbitMQ) publish(queueName string, payload []byte, headers amqp.Table) error {
+func (r *RabbitMQ) publishLegacyWithRecovery(queueName string, payload []byte, headers amqp.Table) error {
+	err := r.publishLegacyWithReconnect(queueName, payload, headers)
+	if err != nil {
+		_ = r.DisasterRecovery(payload)
+	}
+	return err
+}
+
+func (r *RabbitMQ) publishLegacy(queueName string, payload []byte, headers amqp.Table) error {
+	producer := r.currentProducer()
+	if producer == nil {
+		return fmt.Errorf("RabbitMQ producer channel is not initialized")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	return producer.PublishWithContext(ctx, "", queueName, true, false, amqp.Publishing{
+		ContentType: "application/json",
+		Headers:     headers,
+		Body:        payload,
+	})
+}
+
+// publishConfirmedWithReconnect publishes payload (optionally carrying headers) and, on a
+// closed/stale channel, reconnects once and retries. It is the shared body
+// behind confirmed publishing and confirmed consumer transfers.
+func (r *RabbitMQ) publishConfirmedWithReconnect(queueName string, payload []byte, headers amqp.Table) error {
+	if err := r.ensureConnected(); err != nil {
+		return err
+	}
+
+	err := r.publishConfirmed(queueName, payload, headers)
+	if err != nil && (r.needsReconnect() || isClosedError(err)) {
+		if reconnectErr := r.Reconnect(); reconnectErr == nil {
+			err = r.publishConfirmed(queueName, payload, headers)
+		}
+	}
+	return err
+}
+
+func (r *RabbitMQ) publishConfirmed(queueName string, payload []byte, headers amqp.Table) error {
 	r.publishMu.Lock()
 	defer r.publishMu.Unlock()
 
-	producer, returns := r.currentPublisher()
+	producer, returns := r.currentConfirmedPublisher()
 	if producer == nil {
 		return fmt.Errorf("RabbitMQ producer channel is not initialized")
 	}
@@ -1013,7 +1243,7 @@ func (r *RabbitMQ) PublishWithDelay(queueName string, payload []byte, backoff in
 func (r *RabbitMQ) publishWithDelayHeaders(queueName string, payload []byte, backoff int, headers amqp.Table) {
 	go func() {
 		time.Sleep(time.Duration(backoff) * time.Second)
-		_ = r.publishWithReconnect(queueName, payload, headers)
+		_ = r.publishLegacyWithRecovery(queueName, payload, headers)
 	}()
 }
 
@@ -1081,11 +1311,15 @@ func (r *RabbitMQ) retryOrDeadletter(headers amqp.Table, payload []byte, backoff
 // AddToDeadletter adds a message to the deadletter queue
 func (r *RabbitMQ) AddToDeadletter(payload []byte) error {
 	topic := r.options.DeadletterQueue
-	return r.publishWithReconnect(topic, payload, nil)
+	return r.Publish(topic, payload)
+}
+
+func (r *RabbitMQ) addToDeadletterConfirmed(payload []byte) error {
+	return r.publishConfirmedWithReconnect(r.options.DeadletterQueue, payload, nil)
 }
 
 func (r *RabbitMQ) deadletterOrRecover(payload []byte) error {
-	if err := r.AddToDeadletter(payload); err != nil {
+	if err := r.addToDeadletterConfirmed(payload); err != nil {
 		if r.disasterRecoveryHandler == nil {
 			return fmt.Errorf("dead-letter publish failed and no disaster recovery handler is configured: %w", err)
 		}
