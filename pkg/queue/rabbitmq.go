@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -42,6 +43,7 @@ type RabbitOptions struct {
 	Exchange              string
 	ConfirmedDelivery     bool
 	RequireExistingQueues bool
+	VirtualHost           string
 
 	// MaxRetries caps how many times a PipelineRetry re-queues a message before
 	// it is parked on the deadletter queue; zero selects defaultMaxRetries. It is
@@ -173,6 +175,13 @@ func (b *RabbitOptionsBuilder) SetRequireExistingQueues(required bool) *RabbitOp
 	return b
 }
 
+// SetVirtualHost sets the RabbitMQ virtual host. Empty and "/" select the
+// default virtual host.
+func (b *RabbitOptionsBuilder) SetVirtualHost(virtualHost string) *RabbitOptionsBuilder {
+	b.options.VirtualHost = virtualHost
+	return b
+}
+
 // SetTLS enables TLS for the connection
 func (b *RabbitOptionsBuilder) SetTLS(enabled bool) *RabbitOptionsBuilder {
 	b.options.TLS = enabled
@@ -221,10 +230,10 @@ func NewRabbitMQ(options *RabbitOptions) (*RabbitMQ, error) {
 		return nil, err
 	}
 	// Extract protocol from host if present, otherwise default to amqp://
-	protocol := "amqp://"
+	scheme := "amqp"
 	host := options.Host
 	if strings.HasPrefix(host, "amqps://") {
-		protocol = "amqps://"
+		scheme = "amqps"
 		host = strings.TrimPrefix(host, "amqps://")
 		// Auto-enable TLS when amqps:// protocol is detected
 		options.TLS = true
@@ -234,13 +243,24 @@ func NewRabbitMQ(options *RabbitOptions) (*RabbitMQ, error) {
 
 	// If TLS is explicitly enabled, ensure we use amqps:// protocol
 	if options.TLS {
-		protocol = "amqps://"
+		scheme = "amqps"
+	}
+
+	virtualHost := strings.TrimSpace(options.VirtualHost)
+	path := "/"
+	if virtualHost != "" && virtualHost != "/" {
+		path += strings.TrimPrefix(virtualHost, "/")
 	}
 
 	// Build connection string
 	return &RabbitMQ{
-		options:          options,
-		connectionString: protocol + options.Username + ":" + options.Password + "@" + host + "/",
+		options: options,
+		connectionString: (&url.URL{
+			Scheme: scheme,
+			User:   url.UserPassword(options.Username, options.Password),
+			Host:   host,
+			Path:   path,
+		}).String(),
 	}, nil
 }
 

@@ -166,7 +166,7 @@ func readKafkaDeadLetter(ctx context.Context, consumer KafkaConsumer, idleTimeou
 		}
 		if len(assignment) > 0 {
 			*assigned = true
-			return nil, true, nil
+			continue
 		}
 		if time.Now().After(startupDeadline) {
 			return nil, false, fmt.Errorf("timed out waiting for Kafka dead-letter partition assignment")

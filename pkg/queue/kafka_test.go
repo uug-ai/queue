@@ -24,6 +24,33 @@ type fakeKafkaConsumer struct {
 	commitError   error
 }
 
+type assignmentThenMessageKafkaConsumer struct {
+	message   *kafka.Message
+	readCount int
+}
+
+func (*assignmentThenMessageKafkaConsumer) SubscribeTopics([]string, kafka.RebalanceCb) error {
+	return nil
+}
+
+func (f *assignmentThenMessageKafkaConsumer) ReadMessage(time.Duration) (*kafka.Message, error) {
+	f.readCount++
+	if f.readCount == 1 {
+		return nil, kafka.NewError(kafka.ErrTimedOut, "timed out", false)
+	}
+	return f.message, nil
+}
+
+func (*assignmentThenMessageKafkaConsumer) CommitMessage(*kafka.Message) ([]kafka.TopicPartition, error) {
+	return nil, nil
+}
+
+func (*assignmentThenMessageKafkaConsumer) Assignment() ([]kafka.TopicPartition, error) {
+	return []kafka.TopicPartition{{Partition: 0}}, nil
+}
+
+func (*assignmentThenMessageKafkaConsumer) Close() error { return nil }
+
 func (f *fakeKafkaConsumer) SubscribeTopics(topics []string, _ kafka.RebalanceCb) error {
 	f.subscribed = append([]string(nil), topics...)
 	return nil
@@ -199,6 +226,20 @@ func TestKafkaDeadLetterInspectDoesNotCommit(t *testing.T) {
 	}
 	if result.Groups[UnknownSourceQueue].Count != 1 || consumer.commitCount != 0 {
 		t.Fatalf("result=%+v commits=%d", result, consumer.commitCount)
+	}
+}
+
+func TestReadKafkaDeadLetterWaitsAfterInitialAssignment(t *testing.T) {
+	expected := &kafka.Message{Value: []byte("payload")}
+	consumer := &assignmentThenMessageKafkaConsumer{message: expected}
+	assigned := false
+
+	message, done, err := readKafkaDeadLetter(context.Background(), consumer, time.Millisecond, &assigned)
+	if err != nil {
+		t.Fatalf("readKafkaDeadLetter: %v", err)
+	}
+	if done || message != expected || consumer.readCount != 2 {
+		t.Fatalf("message=%p done=%t reads=%d", message, done, consumer.readCount)
 	}
 }
 

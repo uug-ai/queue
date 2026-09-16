@@ -445,6 +445,20 @@ func TestRabbitConnectionStringGeneration(t *testing.T) {
 			},
 			expectedConnStr: "amqp://guest:guest@localhost:5672/",
 		},
+		{
+			name: "VirtualHostAndEscapedCredentials",
+			buildOpts: func() *RabbitOptions {
+				return NewRabbitOptions().
+					SetConsumerQueue("test-queue").
+					SetDeadletterQueue("test-queue-dlq").
+					SetHost("localhost:5672").
+					SetUsername("user@example.com").
+					SetPassword("p@ss:word").
+					SetVirtualHost("tenant").
+					Build()
+			},
+			expectedConnStr: "amqp://user%40example.com:p%40ss%3Aword@localhost:5672/tenant",
+		},
 	}
 
 	for _, tt := range tests {
