@@ -67,6 +67,11 @@ Call `Close` when the client is no longer needed.
 - `SetDisasterRecoveryHandler`
 - `LoadMessages`
 
+Dead-letter inspection and replay are deliberately exposed through the separate
+`DeadLetterAdmin` interface. Runtime consumers therefore do not need
+administrative methods, while operational tooling can use one contract across
+all supported brokers.
+
 ### Pipeline Actions
 
 Message handlers return a `models.PipelineAction`. The queue client maps that
@@ -81,6 +86,43 @@ action to broker operations:
 
 All providers implement at-least-once processing. Handlers and downstream
 writes should therefore be idempotent.
+
+## Dead-Letter Envelopes
+
+`AddToDeadletter` stores a versioned `uug.ai/dead-letter/v1` envelope containing:
+
+- The exact original payload, encoded safely even when it is not valid JSON
+- The source queue or topic
+- The dead-letter destination
+- The failure reason, attempt count, and UTC timestamp
+- Optional service and provider-neutral attributes
+
+For compatibility with existing services, calling `Publish` with the configured
+dead-letter destination is also enveloped automatically. Existing callers do not
+need to migrate in lockstep to start recording their source queue. Runtime
+payloads are always wrapped, even if their JSON resembles an envelope, so payload
+data cannot choose its own replay destination. Administrative tools that need to
+set source metadata use `DeadLetterAdmin.PublishDeadLetter`.
+
+Existing raw dead-letter messages remain readable. They are reported with the
+source `unknown` and require an explicit replay destination because the library
+cannot safely infer where they came from.
+
+## Inspecting and Replaying Dead-Letter Messages
+
+The operational commands are provided by the separate
+[`uug-ai/cli`](https://github.com/uug-ai/cli) project. The underlying
+`DeadLetterAdmin` implementations always publish first and settle the source
+message only after broker acknowledgement:
+
+- RabbitMQ uses a dedicated confirm-mode channel, then acknowledges the delivery.
+- SQS waits for `SendMessage`, then deletes the message using its receipt handle.
+- Kafka and Azure Event Hubs wait for delivery, then commit the source offset.
+
+Inspection remains non-destructive but not side-effect-free: RabbitMQ
+deliveries are durably republished before the originals are acknowledged, and
+SQS visibility is reset after scanning. These operations may affect ordering.
+Kafka/Event Hubs inspection does not commit offsets.
 
 ## Choosing a Broker
 

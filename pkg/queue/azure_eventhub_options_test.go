@@ -38,6 +38,12 @@ func TestAzureEventHubOptionsBuildKafkaConfiguration(t *testing.T) {
 	if kafkaOptions.GroupID != "pipeline" || kafkaOptions.SessionTimeout != 12000 || kafkaOptions.AutoOffsetReset != "latest" || kafkaOptions.MaxRetries != 4 {
 		t.Fatalf("unexpected consumer options: %+v", kafkaOptions)
 	}
+	if kafkaOptions.DeliveryTimeout != 60000 {
+		t.Fatalf("delivery timeout = %d, want 60000", kafkaOptions.DeliveryTimeout)
+	}
+	if !kafkaOptions.DisableAutoTopicCreation {
+		t.Fatal("Event Hubs Kafka clients must disable unsupported automatic topic creation")
+	}
 }
 
 func TestAzureEventHubOptionsNamespace(t *testing.T) {

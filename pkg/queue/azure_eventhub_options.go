@@ -53,6 +53,8 @@ func (a *AzureEventHubOptions) kafkaOptions() (*KafkaOptions, error) {
 		SetSessionTimeout(a.SessionTimeout).
 		SetAutoOffsetReset(a.AutoOffsetReset).
 		SetMaxRetries(a.MaxRetries).
+		SetDeliveryTimeout(60000).
+		SetDisableAutoTopicCreation(true).
 		Build(), nil
 }
 

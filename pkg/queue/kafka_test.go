@@ -3,8 +3,10 @@
 package queue
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,7 +21,35 @@ type fakeKafkaConsumer struct {
 	subscribed    []string
 	commitCount   int
 	commitMessage *kafka.Message
+	commitError   error
 }
+
+type assignmentThenMessageKafkaConsumer struct {
+	message   *kafka.Message
+	readCount int
+}
+
+func (*assignmentThenMessageKafkaConsumer) SubscribeTopics([]string, kafka.RebalanceCb) error {
+	return nil
+}
+
+func (f *assignmentThenMessageKafkaConsumer) ReadMessage(time.Duration) (*kafka.Message, error) {
+	f.readCount++
+	if f.readCount == 1 {
+		return nil, kafka.NewError(kafka.ErrTimedOut, "timed out", false)
+	}
+	return f.message, nil
+}
+
+func (*assignmentThenMessageKafkaConsumer) CommitMessage(*kafka.Message) ([]kafka.TopicPartition, error) {
+	return nil, nil
+}
+
+func (*assignmentThenMessageKafkaConsumer) Assignment() ([]kafka.TopicPartition, error) {
+	return []kafka.TopicPartition{{Partition: 0}}, nil
+}
+
+func (*assignmentThenMessageKafkaConsumer) Close() error { return nil }
 
 func (f *fakeKafkaConsumer) SubscribeTopics(topics []string, _ kafka.RebalanceCb) error {
 	f.subscribed = append([]string(nil), topics...)
@@ -33,13 +63,19 @@ func (f *fakeKafkaConsumer) ReadMessage(time.Duration) (*kafka.Message, error) {
 func (f *fakeKafkaConsumer) CommitMessage(message *kafka.Message) ([]kafka.TopicPartition, error) {
 	f.commitCount++
 	f.commitMessage = message
-	return nil, errStopKafkaConsumer
+	return nil, f.commitError
+}
+
+func (f *fakeKafkaConsumer) Assignment() ([]kafka.TopicPartition, error) {
+	return []kafka.TopicPartition{{Partition: 0}}, nil
 }
 
 func (f *fakeKafkaConsumer) Close() error { return nil }
 
 type fakeKafkaProducer struct {
-	messages []kafka.Message
+	messages    []kafka.Message
+	metadata    *kafka.Metadata
+	metadataErr error
 }
 
 func (f *fakeKafkaProducer) Produce(message *kafka.Message, deliveryChan chan kafka.Event) error {
@@ -52,7 +88,7 @@ func (f *fakeKafkaProducer) Produce(message *kafka.Message, deliveryChan chan ka
 }
 
 func (f *fakeKafkaProducer) GetMetadata(*string, bool, int) (*kafka.Metadata, error) {
-	return &kafka.Metadata{}, nil
+	return f.metadata, f.metadataErr
 }
 
 func (f *fakeKafkaProducer) Flush(int) int { return 0 }
@@ -72,11 +108,143 @@ func newTestKafka(t *testing.T, message *kafka.Message) (*Kafka, *fakeKafkaConsu
 	if err != nil {
 		t.Fatalf("NewKafka: %v", err)
 	}
-	consumer := &fakeKafkaConsumer{message: message}
-	producer := &fakeKafkaProducer{}
+	consumer := &fakeKafkaConsumer{message: message, commitError: errStopKafkaConsumer}
+	producer := &fakeKafkaProducer{
+		metadata: &kafka.Metadata{
+			Topics: map[string]kafka.TopicMetadata{
+				"events": {Topic: "events"},
+			},
+		},
+	}
 	client.Consumer = consumer
 	client.Producer = producer
 	return client, consumer, producer
+}
+
+func TestKafkaDeadLetterReplayPublishesBeforeCommit(t *testing.T) {
+	envelope, err := encodeDeadLetter([]byte("payload"), DeadLetterMetadata{
+		Source:      "events",
+		Destination: "deadletter",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := &kafka.Message{
+		TopicPartition: kafka.TopicPartition{
+			Topic:     stringPointer("deadletter"),
+			Partition: 1,
+			Offset:    42,
+		},
+		Value: envelope,
+	}
+	client, consumer, producer := newTestKafka(t, message)
+	consumer.commitError = nil
+	client.options.DisableAutoTopicCreation = true
+
+	result, err := client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
+		Limit:   1,
+		Execute: true,
+	})
+	if err != nil {
+		t.Fatalf("ReplayDeadLetters: %v", err)
+	}
+	if result.Replayed != 1 || consumer.commitCount != 1 || len(producer.messages) != 1 {
+		t.Fatalf("result=%+v commits=%d messages=%+v", result, consumer.commitCount, producer.messages)
+	}
+	if *producer.messages[0].TopicPartition.Topic != "events" || string(producer.messages[0].Value) != "payload" {
+		t.Fatalf("replayed message = %+v", producer.messages[0])
+	}
+}
+
+func TestKafkaDeadLetterReplayRejectsMissingDestinationBeforePublishOrCommit(t *testing.T) {
+	envelope, err := encodeDeadLetter([]byte("payload"), DeadLetterMetadata{
+		Source:      "missing-events",
+		Destination: "deadletter",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := &kafka.Message{
+		TopicPartition: kafka.TopicPartition{
+			Topic:     stringPointer("deadletter"),
+			Partition: 1,
+			Offset:    42,
+		},
+		Value: envelope,
+	}
+	client, consumer, producer := newTestKafka(t, message)
+	client.options.DisableAutoTopicCreation = true
+
+	_, err = client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
+		Limit:   1,
+		Execute: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), `Kafka topic "missing-events" does not exist`) {
+		t.Fatalf("ReplayDeadLetters error = %v, want missing topic error", err)
+	}
+	if consumer.commitCount != 0 || len(producer.messages) != 0 {
+		t.Fatalf("commits=%d messages=%d, want no commit or publish", consumer.commitCount, len(producer.messages))
+	}
+}
+
+func TestKafkaDeadLetterReplayRequiresAutoTopicCreationDisabled(t *testing.T) {
+	envelope, err := encodeDeadLetter([]byte("payload"), DeadLetterMetadata{
+		Source:      "events",
+		Destination: "deadletter",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := &kafka.Message{
+		TopicPartition: kafka.TopicPartition{Topic: stringPointer("deadletter")},
+		Value:          envelope,
+	}
+	client, consumer, producer := newTestKafka(t, message)
+
+	_, err = client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
+		Limit:   1,
+		Execute: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "automatic topic creation") {
+		t.Fatalf("ReplayDeadLetters error = %v, want safe configuration error", err)
+	}
+	if consumer.commitCount != 0 || len(producer.messages) != 0 {
+		t.Fatalf("commits=%d messages=%d, want no commit or publish", consumer.commitCount, len(producer.messages))
+	}
+}
+
+func TestKafkaDeadLetterInspectDoesNotCommit(t *testing.T) {
+	message := &kafka.Message{
+		TopicPartition: kafka.TopicPartition{Topic: stringPointer("deadletter")},
+		Value:          []byte(`{"legacy":true}`),
+	}
+	client, consumer, _ := newTestKafka(t, message)
+
+	result, err := client.InspectDeadLetters(context.Background(), DeadLetterInspectRequest{Limit: 1})
+	if err != nil {
+		t.Fatalf("InspectDeadLetters: %v", err)
+	}
+	if result.Groups[UnknownSourceQueue].Count != 1 || consumer.commitCount != 0 {
+		t.Fatalf("result=%+v commits=%d", result, consumer.commitCount)
+	}
+}
+
+func TestReadKafkaDeadLetterWaitsAfterInitialAssignment(t *testing.T) {
+	expected := &kafka.Message{Value: []byte("payload")}
+	consumer := &assignmentThenMessageKafkaConsumer{message: expected}
+	assigned := false
+
+	message, done, err := readKafkaDeadLetter(context.Background(), consumer, time.Millisecond, &assigned)
+	if err != nil {
+		t.Fatalf("readKafkaDeadLetter: %v", err)
+	}
+	if done || message != expected || consumer.readCount != 2 {
+		t.Fatalf("message=%p done=%t reads=%d", message, done, consumer.readCount)
+	}
+}
+
+func stringPointer(value string) *string {
+	return &value
 }
 
 func TestNewSelectsKafkaClient(t *testing.T) {
@@ -104,6 +272,18 @@ func TestKafkaConfigMapDisablesAutoCommit(t *testing.T) {
 	if config["session.timeout.ms"] != 10000 || config["auto.offset.reset"] != "earliest" {
 		t.Fatalf("expected historical Kafka defaults, got %v", config)
 	}
+	if _, exists := config["allow.auto.create.topics"]; exists {
+		t.Fatalf("library clients must preserve the provider default, got %v", config)
+	}
+}
+
+func TestKafkaConfigMapCanDisableAutoTopicCreation(t *testing.T) {
+	client, _, _ := newTestKafka(t, nil)
+	client.options.DisableAutoTopicCreation = true
+
+	if got := client.configMap()["allow.auto.create.topics"]; got != false {
+		t.Fatalf("allow.auto.create.topics = %v, want false", got)
+	}
 }
 
 func TestKafkaPublishWaitsForDelivery(t *testing.T) {
@@ -111,11 +291,26 @@ func TestKafkaPublishWaitsForDelivery(t *testing.T) {
 	if err := client.Publish("target", []byte("payload")); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
+
 	if len(producer.messages) != 1 {
 		t.Fatalf("published messages = %d, want 1", len(producer.messages))
 	}
 	if topic := *producer.messages[0].TopicPartition.Topic; topic != "target" {
 		t.Fatalf("published topic = %q, want target", topic)
+	}
+}
+
+func TestKafkaPublishToDeadLetterTopicAddsEnvelope(t *testing.T) {
+	client, _, producer := newTestKafka(t, nil)
+	if err := client.Publish("deadletter", []byte("payload")); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	message, err := decodeDeadLetter("deadletter", producer.messages[0].Value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.Legacy || message.DeadLetter.Source != "events" || string(message.Payload) != "payload" {
+		t.Fatalf("dead-letter message = %+v", message)
 	}
 }
 
@@ -174,6 +369,13 @@ func TestKafkaMalformedMessageDeadlettersThenCommits(t *testing.T) {
 	}
 	if len(producer.messages) != 1 || *producer.messages[0].TopicPartition.Topic != "deadletter" {
 		t.Fatalf("deadletter messages = %+v, want one deadletter message", producer.messages)
+	}
+	deadLetter, err := decodeDeadLetter("deadletter", producer.messages[0].Value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deadLetter.DeadLetter.Source != "events" || deadLetter.DeadLetter.Reason != DeadLetterReasonMalformed {
+		t.Fatalf("dead-letter metadata = %+v", deadLetter.DeadLetter)
 	}
 }
 
