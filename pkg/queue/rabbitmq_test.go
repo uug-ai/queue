@@ -446,7 +446,7 @@ func TestRabbitConnectionStringGeneration(t *testing.T) {
 			expectedConnStr: "amqp://guest:guest@localhost:5672/",
 		},
 		{
-			name: "VirtualHostAndEscapedCredentials",
+			name: "EscapedCredentials",
 			buildOpts: func() *RabbitOptions {
 				return NewRabbitOptions().
 					SetConsumerQueue("test-queue").
@@ -454,10 +454,9 @@ func TestRabbitConnectionStringGeneration(t *testing.T) {
 					SetHost("localhost:5672").
 					SetUsername("user@example.com").
 					SetPassword("p@ss:word").
-					SetVirtualHost("tenant").
 					Build()
 			},
-			expectedConnStr: "amqp://user%40example.com:p%40ss%3Aword@localhost:5672/tenant",
+			expectedConnStr: "amqp://user%40example.com:p%40ss%3Aword@localhost:5672/",
 		},
 	}
 
@@ -475,6 +474,24 @@ func TestRabbitConnectionStringGeneration(t *testing.T) {
 				t.Errorf("expected connection string '%s', got '%s'", tt.expectedConnStr, rabbit.connectionString)
 			}
 		})
+	}
+}
+
+func TestRabbitMQVirtualHostPreservesLeadingSlash(t *testing.T) {
+	options := NewRabbitOptions().
+		SetConsumerQueue("test-queue").
+		SetDeadletterQueue("test-queue-dlq").
+		SetHost("localhost:5672").
+		SetUsername("guest").
+		SetPassword("guest").
+		SetVirtualHost("/tenant").
+		Build()
+	client, err := NewRabbitMQ(options)
+	if err != nil {
+		t.Fatalf("NewRabbitMQ: %v", err)
+	}
+	if got := client.virtualHost(); got != "/tenant" {
+		t.Fatalf("virtual host = %q, want /tenant", got)
 	}
 }
 

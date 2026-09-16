@@ -246,12 +246,6 @@ func NewRabbitMQ(options *RabbitOptions) (*RabbitMQ, error) {
 		scheme = "amqps"
 	}
 
-	virtualHost := strings.TrimSpace(options.VirtualHost)
-	path := "/"
-	if virtualHost != "" && virtualHost != "/" {
-		path += strings.TrimPrefix(virtualHost, "/")
-	}
-
 	// Build connection string
 	return &RabbitMQ{
 		options: options,
@@ -259,7 +253,7 @@ func NewRabbitMQ(options *RabbitOptions) (*RabbitMQ, error) {
 			Scheme: scheme,
 			User:   url.UserPassword(options.Username, options.Password),
 			Host:   host,
-			Path:   path,
+			Path:   "/",
 		}).String(),
 	}, nil
 }
@@ -305,6 +299,7 @@ func (r *RabbitMQ) connectLocked() error {
 	connection, err := amqp.DialConfig(r.connectionString, amqp.Config{
 		Heartbeat:       time.Duration(10) * time.Second, // Set the default heartbeat interval
 		TLSClientConfig: tlsConfig,                       // TLS configuration (nil when TLS is disabled)
+		Vhost:           r.virtualHost(),
 	})
 	if err != nil {
 		return err
@@ -388,6 +383,13 @@ func (r *RabbitMQ) connectLocked() error {
 	r.closeResources(oldConsumer, oldProducer, oldConfirmedProducer, oldConnection)
 
 	return nil
+}
+
+func (r *RabbitMQ) virtualHost() string {
+	if r.options.VirtualHost == "" {
+		return "/"
+	}
+	return r.options.VirtualHost
 }
 
 // Reconnect attempts to re-establish the RabbitMQ connection

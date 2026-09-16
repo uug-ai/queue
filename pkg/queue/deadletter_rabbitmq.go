@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -38,11 +39,11 @@ func (r *RabbitMQ) InspectDeadLetters(ctx context.Context, request DeadLetterIns
 	deliveries := make([]amqp.Delivery, 0, request.Limit)
 	for len(deliveries) < request.Limit {
 		if err := ctx.Err(); err != nil {
-			return result, errors.Join(err, requeueRabbitDeadLetters(deliveries))
+			return result, errors.Join(err, r.restoreRabbitDeadLetters(deliveries))
 		}
 		delivery, ok, err := r.getDeadLetter()
 		if err != nil {
-			return result, errors.Join(err, requeueRabbitDeadLetters(deliveries))
+			return result, errors.Join(err, r.restoreRabbitDeadLetters(deliveries))
 		}
 		if !ok {
 			break
@@ -50,11 +51,11 @@ func (r *RabbitMQ) InspectDeadLetters(ctx context.Context, request DeadLetterIns
 		deliveries = append(deliveries, delivery)
 		decoded, err := decodeDeadLetter(rabbitDeadLetterID(delivery), delivery.Body)
 		if err != nil {
-			return result, errors.Join(err, requeueRabbitDeadLetters(deliveries))
+			return result, errors.Join(err, r.restoreRabbitDeadLetters(deliveries))
 		}
 		addDeadLetterInspection(&result, decoded, request.Source)
 	}
-	if err := requeueRabbitDeadLetters(deliveries); err != nil {
+	if err := r.restoreRabbitDeadLetters(deliveries); err != nil {
 		return result, err
 	}
 	return result, nil
@@ -73,7 +74,7 @@ func (r *RabbitMQ) ReplayDeadLetters(ctx context.Context, request DeadLetterRepl
 
 	retained := make([]amqp.Delivery, 0, request.Limit)
 	requeueRetained := func(operationErr error) error {
-		return errors.Join(operationErr, requeueRabbitDeadLetters(retained))
+		return errors.Join(operationErr, r.restoreRabbitDeadLetters(retained))
 	}
 	for result.Scanned < request.Limit {
 		if err := ctx.Err(); err != nil {
@@ -107,7 +108,7 @@ func (r *RabbitMQ) ReplayDeadLetters(ctx context.Context, request DeadLetterRepl
 		retained = retained[:len(retained)-1]
 		result.Replayed++
 	}
-	if err := requeueRabbitDeadLetters(retained); err != nil {
+	if err := r.restoreRabbitDeadLetters(retained); err != nil {
 		return result, err
 	}
 	return result, nil
@@ -183,11 +184,22 @@ func (r *RabbitMQ) publishDeadLetterConfirmed(ctx context.Context, destination s
 	}
 }
 
-func requeueRabbitDeadLetters(deliveries []amqp.Delivery) error {
+func (r *RabbitMQ) restoreRabbitDeadLetters(deliveries []amqp.Delivery) error {
 	var result error
-	for index := len(deliveries) - 1; index >= 0; index-- {
-		if err := deliveries[index].Nack(false, true); err != nil {
-			result = errors.Join(result, err)
+	for _, delivery := range deliveries {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := r.publishDeadLetterConfirmed(ctx, r.options.DeadletterQueue, delivery.Body)
+		cancel()
+		if err != nil {
+			nackErr := delivery.Nack(false, true)
+			result = errors.Join(result, fmt.Errorf("republish retained RabbitMQ dead-letter message: %w", err))
+			if nackErr != nil {
+				result = errors.Join(result, fmt.Errorf("requeue retained RabbitMQ dead-letter message: %w", nackErr))
+			}
+			continue
+		}
+		if err := delivery.Ack(false); err != nil {
+			result = errors.Join(result, fmt.Errorf("settle retained RabbitMQ dead-letter message: %w", err))
 		}
 	}
 	return result

@@ -120,9 +120,9 @@ message only after broker acknowledgement:
 - Kafka and Azure Event Hubs wait for delivery, then commit the source offset.
 
 Inspection remains non-destructive but not side-effect-free: RabbitMQ
-deliveries are requeued and SQS visibility is reset after scanning, which may
-affect ordering and redelivery metadata. Kafka/Event Hubs inspection does not
-commit offsets.
+deliveries are durably republished before the originals are acknowledged, and
+SQS visibility is reset after scanning. These operations may affect ordering.
+Kafka/Event Hubs inspection does not commit offsets.
 
 ## Choosing a Broker
 

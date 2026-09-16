@@ -213,12 +213,21 @@ func TestRabbitDeadLetterInspectRequeuesMessages(t *testing.T) {
 		deliveries = deliveries[1:]
 		return delivery, true, nil
 	}
+	var restored [][]byte
+	client.deadLetterReplayPublish = func(_ context.Context, destination string, payload []byte) error {
+		if destination != "deadletter" {
+			t.Fatalf("restore destination = %q", destination)
+		}
+		restored = append(restored, append([]byte(nil), payload...))
+		return nil
+	}
 
 	result, err := client.InspectDeadLetters(context.Background(), DeadLetterInspectRequest{Limit: 1})
 	if err != nil {
 		t.Fatalf("InspectDeadLetters: %v", err)
 	}
-	if result.Groups[UnknownSourceQueue].Count != 1 || len(acknowledger.requeued) != 1 {
+	if result.Groups[UnknownSourceQueue].Count != 1 || len(restored) != 1 ||
+		len(acknowledger.acked) != 1 || len(acknowledger.requeued) != 0 {
 		t.Fatalf("result=%+v acknowledger=%+v", result, acknowledger)
 	}
 }
