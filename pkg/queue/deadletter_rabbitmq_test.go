@@ -178,6 +178,25 @@ func TestRabbitReadMessagesToDeadletterRequiresConfirmedDelivery(t *testing.T) {
 	}
 }
 
+func TestRabbitReadMessagesToDeadletterRejectsSameQueue(t *testing.T) {
+	client, err := NewRabbitMQ(NewRabbitOptions().
+		SetConsumerQueue("deadletter").
+		SetDeadletterQueue("deadletter").
+		SetHost("rabbitmq:5672").
+		SetUsername("guest").
+		SetPassword("guest").
+		SetConfirmedDelivery(true).
+		Build())
+	if err != nil {
+		t.Fatalf("NewRabbitMQ: %v", err)
+	}
+
+	err = client.ReadMessagesToDeadletter(DeadLetterReasonHandlerError)
+	if err == nil || !strings.Contains(err.Error(), "must differ") {
+		t.Fatalf("error = %v, want same-queue rejection", err)
+	}
+}
+
 func TestRabbitDeadLetterEnvelopePreservesFailureReason(t *testing.T) {
 	client, err := NewRabbitMQ(NewRabbitOptions().
 		SetConsumerQueue("events").

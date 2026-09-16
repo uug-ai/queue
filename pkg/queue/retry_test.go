@@ -31,37 +31,18 @@ func TestSetMaxRetriesBuilder(t *testing.T) {
 	if opts := NewRabbitOptions().SetMaxRetries(7).Build(); opts.MaxRetries != 7 {
 		t.Errorf("MaxRetries = %d, want 7", opts.MaxRetries)
 	}
-	// Unset preserves the historical unlimited retry behavior.
+	// Unset leaves the zero value so the client falls back to defaultMaxRetries.
 	if def := NewRabbitOptions().Build(); def.MaxRetries != 0 {
-		t.Errorf("default MaxRetries = %d, want 0", def.MaxRetries)
+		t.Errorf("default MaxRetries = %d, want 0 (selects defaultMaxRetries at runtime)", def.MaxRetries)
 	}
 }
 
-func TestMaxRetries(t *testing.T) {
-	if got := newTestRabbit(t, 0).maxRetries(); got != 0 {
-		t.Errorf("maxRetries() with unset option = %d, want unlimited (0)", got)
+func TestMaxRetriesDefault(t *testing.T) {
+	if got := newTestRabbit(t, 0).maxRetries(); got != defaultMaxRetries {
+		t.Errorf("maxRetries() with unset option = %d, want default %d", got, defaultMaxRetries)
 	}
 	if got := newTestRabbit(t, 3).maxRetries(); got != 3 {
 		t.Errorf("maxRetries() = %d, want 3", got)
-	}
-}
-
-func TestRetryOrDeadletterRetriesWithoutCap(t *testing.T) {
-	rabbit := newTestRabbit(t, 0)
-	var queueName string
-
-	err := rabbit.retryOrDeadletter(amqp.Table{retryCountHeader: int32(100)}, []byte("payload"), time.Nanosecond, func(gotQueue string, _ []byte, headers amqp.Table) error {
-		queueName = gotQueue
-		if got := retryCount(headers); got != 101 {
-			t.Fatalf("retry header = %d, want 101", got)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("retryOrDeadletter() error = %v", err)
-	}
-	if queueName != "c" {
-		t.Fatalf("queue = %q, want consumer queue", queueName)
 	}
 }
 

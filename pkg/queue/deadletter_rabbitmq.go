@@ -29,6 +29,9 @@ func (r *RabbitMQ) PublishDeadLetter(ctx context.Context, payload []byte, metada
 // dead-letter envelopes. Each source delivery is acknowledged only after the
 // broker confirms the dead-letter publish.
 func (r *RabbitMQ) ReadMessagesToDeadletter(reason DeadLetterReason) error {
+	if r.options.ConsumerQueue == r.options.DeadletterQueue {
+		return fmt.Errorf("RabbitMQ consumer queue and dead-letter queue must differ for raw transfer")
+	}
 	if err := r.requireConfirmedDelivery(); err != nil {
 		return err
 	}
