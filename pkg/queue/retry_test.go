@@ -113,10 +113,17 @@ func TestRetryOrDeadletterUsesDeadletterAtCap(t *testing.T) {
 	rabbit := newTestRabbit(t, 2)
 
 	var queueName string
-	err := rabbit.retryOrDeadletter(amqp.Table{retryCountHeader: int32(2)}, []byte("payload"), time.Nanosecond, func(gotQueue string, _ []byte, headers amqp.Table) error {
+	err := rabbit.retryOrDeadletter(amqp.Table{retryCountHeader: int32(2)}, []byte("payload"), time.Nanosecond, func(gotQueue string, payload []byte, headers amqp.Table) error {
 		queueName = gotQueue
 		if headers != nil {
 			t.Fatalf("deadletter headers = %v, want nil", headers)
+		}
+		deadLetter, decodeErr := decodeDeadLetter("deadletter", payload)
+		if decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		if deadLetter.DeadLetter.Source != "c" || deadLetter.DeadLetter.Reason != DeadLetterReasonRetryExhausted || deadLetter.DeadLetter.Attempts != 2 {
+			t.Fatalf("dead-letter metadata = %+v", deadLetter.DeadLetter)
 		}
 		return nil
 	})

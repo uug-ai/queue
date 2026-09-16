@@ -4,18 +4,20 @@ import "github.com/go-playground/validator/v10"
 
 // KafkaOptions holds the configuration for Kafka.
 type KafkaOptions struct {
-	ConsumerTopic   string `validate:"required"`
-	RouterTopic     string
-	DeadletterTopic string `validate:"required"`
-	Broker          string `validate:"required"`
-	GroupID         string `validate:"required"`
-	Username        string
-	Password        string
-	Mechanism       string
-	Security        string
-	SessionTimeout  int
-	AutoOffsetReset string
-	MaxRetries      int
+	ConsumerTopic            string `validate:"required"`
+	RouterTopic              string
+	DeadletterTopic          string `validate:"required"`
+	Broker                   string `validate:"required"`
+	GroupID                  string `validate:"required"`
+	Username                 string
+	Password                 string
+	Mechanism                string
+	Security                 string
+	SessionTimeout           int
+	AutoOffsetReset          string
+	MaxRetries               int
+	DeliveryTimeout          int
+	DisableAutoTopicCreation bool
 }
 
 // Validate validates the KafkaOptions configuration.
@@ -111,6 +113,16 @@ func (b *KafkaOptionsBuilder) SetAutoOffsetReset(reset string) *KafkaOptionsBuil
 
 func (b *KafkaOptionsBuilder) SetMaxRetries(maxRetries int) *KafkaOptionsBuilder {
 	b.options.MaxRetries = maxRetries
+	return b
+}
+
+func (b *KafkaOptionsBuilder) SetDeliveryTimeout(milliseconds int) *KafkaOptionsBuilder {
+	b.options.DeliveryTimeout = milliseconds
+	return b
+}
+
+func (b *KafkaOptionsBuilder) SetDisableAutoTopicCreation(disabled bool) *KafkaOptionsBuilder {
+	b.options.DisableAutoTopicCreation = disabled
 	return b
 }
 

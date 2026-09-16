@@ -3,7 +3,9 @@
 package queue
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -21,6 +23,10 @@ type KafkaConsumer interface {
 	ReadMessage(timeout time.Duration) (*kafka.Message, error)
 	CommitMessage(message *kafka.Message) ([]kafka.TopicPartition, error)
 	Close() error
+}
+
+type kafkaAssignmentReader interface {
+	Assignment() ([]kafka.TopicPartition, error)
 }
 
 type KafkaProducer interface {
@@ -76,6 +82,12 @@ func (k *Kafka) configMap() kafka.ConfigMap {
 	if k.options.Password != "" {
 		config["sasl.password"] = k.options.Password
 	}
+	if k.options.DeliveryTimeout > 0 {
+		config["request.timeout.ms"] = k.options.DeliveryTimeout
+	}
+	if k.options.DisableAutoTopicCreation {
+		config["allow.auto.create.topics"] = false
+	}
 	return config
 }
 
@@ -93,7 +105,7 @@ func (k *Kafka) Connect() error {
 		_ = consumer.Close()
 		return err
 	}
-	if _, err := producer.GetMetadata(nil, false, int(kafkaDeliveryTimeout/time.Millisecond)); err != nil {
+	if _, err := producer.GetMetadata(nil, false, int(k.deliveryTimeout()/time.Millisecond)); err != nil {
 		producer.Close()
 		_ = consumer.Close()
 		return err
@@ -123,7 +135,7 @@ func (k *Kafka) Close() {
 
 func (k *Kafka) closeClients(consumer KafkaConsumer, producer KafkaProducer) {
 	if producer != nil {
-		producer.Flush(int(kafkaDeliveryTimeout / time.Millisecond))
+		producer.Flush(int(k.deliveryTimeout() / time.Millisecond))
 		producer.Close()
 	}
 	if consumer != nil {
@@ -146,6 +158,9 @@ func (k *Kafka) ensureConnected() error {
 }
 
 func (k *Kafka) Publish(topic string, payload []byte) error {
+	if topic == k.options.DeadletterTopic {
+		return k.addToDeadletter(payload, DeadLetterReasonUnspecified, 0)
+	}
 	return k.publishWithReconnect(topic, payload, nil)
 }
 
@@ -169,6 +184,12 @@ func (k *Kafka) publishWithReconnect(topic string, payload []byte, headers []kaf
 }
 
 func (k *Kafka) publish(producer KafkaProducer, topic string, payload []byte, headers []kafka.Header) error {
+	ctx, cancel := context.WithTimeout(context.Background(), k.deliveryTimeout())
+	defer cancel()
+	return k.publishContext(ctx, producer, topic, payload, headers)
+}
+
+func (k *Kafka) publishContext(ctx context.Context, producer KafkaProducer, topic string, payload []byte, headers []kafka.Header) error {
 	if producer == nil {
 		return fmt.Errorf("Kafka producer is not initialized")
 	}
@@ -191,8 +212,8 @@ func (k *Kafka) publish(producer KafkaProducer, topic string, payload []byte, he
 		default:
 			return fmt.Errorf("unexpected Kafka delivery event %T", event)
 		}
-	case <-time.After(kafkaDeliveryTimeout):
-		return fmt.Errorf("Kafka delivery timed out for topic %q", topic)
+	case <-ctx.Done():
+		return fmt.Errorf("Kafka delivery timed out for topic %q: %w", topic, ctx.Err())
 	}
 }
 
@@ -211,8 +232,7 @@ func (k *Kafka) ReadMessages(handleMessage models.MessageHandler, handlePromethe
 		payload := message.Value
 		var pipelineEvent models.PipelineEvent
 		if err := json.Unmarshal(payload, &pipelineEvent); err != nil {
-			k.preserve(payload)
-			return nil
+			return k.preserve(payload, DeadLetterReasonMalformed)
 		}
 
 		action, pipelineEvent, backoff := handleMessage(pipelineEvent, args...)
@@ -224,19 +244,18 @@ func (k *Kafka) ReadMessages(handleMessage models.MessageHandler, handlePromethe
 			pipelineEvent.Stages = pipelineEvent.Stages[1:]
 			forwardPayload, err := json.Marshal(pipelineEvent)
 			if err != nil {
-				k.preserve(payload)
-				break
+				return k.preserve(payload, DeadLetterReasonMalformed)
 			}
 			if err := k.Publish(k.options.RouterTopic, forwardPayload); err != nil {
-				k.preserve(payload)
+				return k.preserve(payload, DeadLetterReasonPublishFailed)
 			}
 		case models.PipelineError:
 			deadletterPayload, err := json.Marshal(pipelineEvent)
 			if err != nil {
 				deadletterPayload = payload
 			}
-			if err := k.Publish(k.options.DeadletterTopic, deadletterPayload); err != nil {
-				k.preserve(payload)
+			if err := k.addToDeadletter(deadletterPayload, DeadLetterReasonHandlerError, 0); err != nil {
+				return k.recoverDeadLetter(payload, err)
 			}
 		case models.PipelineRetry:
 			if err := k.retryOrDeadletter(message.Headers, payload, backoff); err != nil {
@@ -254,13 +273,12 @@ func (k *Kafka) RouteMessages(_ models.MessageHandler, handlePrometheus models.P
 		started := time.Now()
 		var pipelineEvent models.PipelineEvent
 		if err := json.Unmarshal(message.Value, &pipelineEvent); err != nil {
-			k.preserve(message.Value)
-			return nil
+			return k.preserve(message.Value, DeadLetterReasonMalformed)
 		}
 		if len(pipelineEvent.Stages) > 0 {
 			topic := "kcloud-" + pipelineEvent.Stages[0] + "-queue"
 			if err := k.Publish(topic, message.Value); err != nil {
-				k.preserve(message.Value)
+				return k.preserve(message.Value, DeadLetterReasonPublishFailed)
 			}
 		}
 		handlePrometheus(models.PipelineMetrics{ProcessingTime: time.Since(started).Seconds()})
@@ -275,17 +293,16 @@ func (k *Kafka) ReadRawMessages(handleMessage RawMessageHandler, handlePrometheu
 		switch action {
 		case models.PipelineForward:
 			if k.options.RouterTopic == "" {
-				k.preserve(message.Value)
-				break
+				return k.preserve(message.Value, DeadLetterReasonPublishFailed)
 			}
 			if output == nil {
 				output = message.Value
 			}
 			if err := k.Publish(k.options.RouterTopic, output); err != nil {
-				k.preserve(message.Value)
+				return k.preserve(message.Value, DeadLetterReasonPublishFailed)
 			}
 		case models.PipelineError:
-			k.preserve(message.Value)
+			return k.preserve(message.Value, DeadLetterReasonHandlerError)
 		case models.PipelineRetry:
 			if err := k.retryOrDeadletter(message.Headers, message.Value, backoff); err != nil {
 				return err
@@ -358,7 +375,7 @@ func kafkaRetryHeaders(headers []kafka.Header, count int) []kafka.Header {
 func (k *Kafka) retryOrDeadletter(headers []kafka.Header, payload []byte, backoff int) error {
 	attempts := kafkaRetryCount(headers)
 	if attempts >= k.maxRetries() {
-		return k.AddToDeadletter(payload)
+		return k.addToDeadletter(payload, DeadLetterReasonRetryExhausted, attempts)
 	}
 	if backoff <= 0 {
 		backoff = 5
@@ -368,13 +385,44 @@ func (k *Kafka) retryOrDeadletter(headers []kafka.Header, payload []byte, backof
 }
 
 func (k *Kafka) AddToDeadletter(payload []byte) error {
-	return k.Publish(k.options.DeadletterTopic, payload)
+	return k.addToDeadletter(payload, DeadLetterReasonUnspecified, 0)
 }
 
-func (k *Kafka) preserve(payload []byte) {
-	if err := k.AddToDeadletter(payload); err != nil {
-		_ = k.DisasterRecovery(payload)
+func (k *Kafka) addToDeadletter(payload []byte, reason DeadLetterReason, attempts int) error {
+	envelope, err := encodeDeadLetter(payload, DeadLetterMetadata{
+		Source:      k.options.ConsumerTopic,
+		Destination: k.options.DeadletterTopic,
+		Reason:      reason,
+		Attempts:    attempts,
+	})
+	if err != nil {
+		return err
 	}
+	return k.publishWithReconnect(k.options.DeadletterTopic, envelope, nil)
+}
+
+func (k *Kafka) preserve(payload []byte, reason DeadLetterReason) error {
+	if err := k.addToDeadletter(payload, reason, 0); err != nil {
+		return k.recoverDeadLetter(payload, err)
+	}
+	return nil
+}
+
+func (k *Kafka) recoverDeadLetter(payload []byte, deadLetterErr error) error {
+	if k.disasterRecoveryHandler == nil {
+		return deadLetterErr
+	}
+	if recoveryErr := k.DisasterRecovery(payload); recoveryErr != nil {
+		return errors.Join(deadLetterErr, recoveryErr)
+	}
+	return nil
+}
+
+func (k *Kafka) deliveryTimeout() time.Duration {
+	if k.options.DeliveryTimeout > 0 {
+		return time.Duration(k.options.DeliveryTimeout) * time.Millisecond
+	}
+	return kafkaDeliveryTimeout
 }
 
 func (k *Kafka) SetDisasterRecoveryHandler(handler DisasterRecoveryHandler) {

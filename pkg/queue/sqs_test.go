@@ -21,6 +21,8 @@ type fakeSQSClient struct {
 	deleted           []*awssqs.DeleteMessageInput
 	visibilityChanges []*awssqs.ChangeMessageVisibilityInput
 	deleteError       error
+	visibilityError   error
+	operations        []string
 }
 
 func (f *fakeSQSClient) GetQueueUrl(_ context.Context, input *awssqs.GetQueueUrlInput, _ ...func(*awssqs.Options)) (*awssqs.GetQueueUrlOutput, error) {
@@ -37,17 +39,20 @@ func (f *fakeSQSClient) ReceiveMessage(context.Context, *awssqs.ReceiveMessageIn
 
 func (f *fakeSQSClient) SendMessage(_ context.Context, input *awssqs.SendMessageInput, _ ...func(*awssqs.Options)) (*awssqs.SendMessageOutput, error) {
 	f.sent = append(f.sent, input)
+	f.operations = append(f.operations, "send")
 	return &awssqs.SendMessageOutput{}, nil
 }
 
 func (f *fakeSQSClient) DeleteMessage(_ context.Context, input *awssqs.DeleteMessageInput, _ ...func(*awssqs.Options)) (*awssqs.DeleteMessageOutput, error) {
 	f.deleted = append(f.deleted, input)
+	f.operations = append(f.operations, "delete")
 	return &awssqs.DeleteMessageOutput{}, f.deleteError
 }
 
 func (f *fakeSQSClient) ChangeMessageVisibility(_ context.Context, input *awssqs.ChangeMessageVisibilityInput, _ ...func(*awssqs.Options)) (*awssqs.ChangeMessageVisibilityOutput, error) {
 	f.visibilityChanges = append(f.visibilityChanges, input)
-	return &awssqs.ChangeMessageVisibilityOutput{}, errStopSQSConsumer
+	f.operations = append(f.operations, "visibility")
+	return &awssqs.ChangeMessageVisibilityOutput{}, f.visibilityError
 }
 
 func newTestSQS(t *testing.T, message types.Message) (*SQS, *fakeSQSClient) {
@@ -71,7 +76,9 @@ func newTestSQS(t *testing.T, message types.Message) (*SQS, *fakeSQSClient) {
 		},
 		receiveMessages: []types.Message{message},
 		deleteError:     errStopSQSConsumer,
+		visibilityError: errStopSQSConsumer,
 	}
+
 	client.Client = fake
 	client.consumerQueueURL = fake.queueURLs["events"]
 	client.queueURLs = map[string]string{
@@ -80,6 +87,79 @@ func newTestSQS(t *testing.T, message types.Message) (*SQS, *fakeSQSClient) {
 		"deadletter": fake.queueURLs["deadletter"],
 	}
 	return client, fake
+}
+
+func TestSQSDeadLetterReplaySendsBeforeDelete(t *testing.T) {
+	envelope, err := encodeDeadLetter([]byte("payload"), DeadLetterMetadata{
+		Source:      "events",
+		Destination: "deadletter",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := types.Message{
+		MessageId:     aws.String("message-1"),
+		Body:          aws.String(string(envelope)),
+		ReceiptHandle: aws.String("receipt"),
+	}
+	client, fake := newTestSQS(t, message)
+	fake.deleteError = nil
+	fake.visibilityError = nil
+
+	result, err := client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
+		Limit:   1,
+		Execute: true,
+	})
+	if err != nil {
+		t.Fatalf("ReplayDeadLetters: %v", err)
+	}
+	if result.Replayed != 1 || len(fake.operations) != 2 || fake.operations[0] != "send" || fake.operations[1] != "delete" {
+		t.Fatalf("result=%+v operations=%v", result, fake.operations)
+	}
+	if aws.ToString(fake.sent[0].QueueUrl) != fake.queueURLs["events"] || aws.ToString(fake.sent[0].MessageBody) != "payload" {
+		t.Fatalf("replay send = %+v", fake.sent[0])
+	}
+}
+
+func TestSQSDeadLetterInspectReleasesMessages(t *testing.T) {
+	message := types.Message{
+		MessageId:     aws.String("legacy-1"),
+		Body:          aws.String(`{"legacy":true}`),
+		ReceiptHandle: aws.String("receipt"),
+	}
+
+	client, fake := newTestSQS(t, message)
+	fake.visibilityError = nil
+
+	result, err := client.InspectDeadLetters(context.Background(), DeadLetterInspectRequest{Limit: 1})
+	if err != nil {
+		t.Fatalf("InspectDeadLetters: %v", err)
+	}
+	if result.Groups[UnknownSourceQueue].Count != 1 || len(fake.visibilityChanges) != 1 || fake.visibilityChanges[0].VisibilityTimeout != 0 {
+		t.Fatalf("result=%+v visibility=%+v", result, fake.visibilityChanges)
+	}
+}
+
+func TestSQSDeadLetterReplayRejectsDeadLetterURLAlias(t *testing.T) {
+	message := types.Message{
+		MessageId:     aws.String("legacy-1"),
+		Body:          aws.String(`{"legacy":true}`),
+		ReceiptHandle: aws.String("receipt"),
+	}
+	client, fake := newTestSQS(t, message)
+	fake.visibilityError = nil
+
+	_, err := client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
+		Limit:       1,
+		Destination: fake.queueURLs["deadletter"],
+		Execute:     true,
+	})
+	if err == nil {
+		t.Fatal("expected dead-letter URL alias to be rejected")
+	}
+	if len(fake.sent) != 0 || len(fake.deleted) != 0 || len(fake.visibilityChanges) != 1 {
+		t.Fatalf("sent=%d deleted=%d visibility=%d", len(fake.sent), len(fake.deleted), len(fake.visibilityChanges))
+	}
 }
 
 func testSQSMessage(t *testing.T, event models.PipelineEvent, receiveCount string) types.Message {
@@ -115,8 +195,39 @@ func TestSQSPublish(t *testing.T) {
 	if err := client.Publish("router", []byte("payload")); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
+
 	if len(fake.sent) != 1 || aws.ToString(fake.sent[0].QueueUrl) != fake.queueURLs["router"] || aws.ToString(fake.sent[0].MessageBody) != "payload" {
 		t.Fatalf("unexpected send: %+v", fake.sent)
+	}
+}
+
+func TestSQSPublishToDeadLetterQueueAddsEnvelope(t *testing.T) {
+	client, fake := newTestSQS(t, types.Message{})
+	if err := client.Publish("deadletter", []byte("payload")); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	message, err := decodeDeadLetter("deadletter", []byte(aws.ToString(fake.sent[0].MessageBody)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.Legacy || message.DeadLetter.Source != "events" || string(message.Payload) != "payload" {
+		t.Fatalf("dead-letter message = %+v", message)
+	}
+}
+
+func TestSQSPublishWithDelayToDeadLetterQueueAddsEnvelope(t *testing.T) {
+	client, fake := newTestSQS(t, types.Message{})
+	client.PublishWithDelay("deadletter", []byte("payload"), 5)
+
+	if len(fake.sent) != 1 || fake.sent[0].DelaySeconds != 5 {
+		t.Fatalf("unexpected delayed send: %+v", fake.sent)
+	}
+	message, err := decodeDeadLetter("deadletter", []byte(aws.ToString(fake.sent[0].MessageBody)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.Legacy || message.DeadLetter.Source != "events" || string(message.Payload) != "payload" {
+		t.Fatalf("dead-letter message = %+v", message)
 	}
 }
 
@@ -205,6 +316,13 @@ func TestSQSRetryExhaustionDeadlettersBeforeDelete(t *testing.T) {
 	}
 	if len(fake.sent) != 1 || aws.ToString(fake.sent[0].QueueUrl) != fake.queueURLs["deadletter"] {
 		t.Fatalf("expected deadletter publish: %+v", fake.sent)
+	}
+	deadLetter, decodeErr := decodeDeadLetter("deadletter", []byte(aws.ToString(fake.sent[0].MessageBody)))
+	if decodeErr != nil {
+		t.Fatal(decodeErr)
+	}
+	if deadLetter.DeadLetter.Source != "events" || deadLetter.DeadLetter.Reason != DeadLetterReasonRetryExhausted || deadLetter.DeadLetter.Attempts != 2 {
+		t.Fatalf("dead-letter metadata = %+v", deadLetter.DeadLetter)
 	}
 	if len(fake.deleted) != 1 || len(fake.visibilityChanges) != 0 {
 		t.Fatalf("unexpected exhaustion operations: deleted=%d visibility=%d", len(fake.deleted), len(fake.visibilityChanges))

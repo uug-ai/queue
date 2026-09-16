@@ -67,6 +67,11 @@ Call `Close` when the client is no longer needed.
 - `SetDisasterRecoveryHandler`
 - `LoadMessages`
 
+Dead-letter inspection and replay are deliberately exposed through the separate
+`DeadLetterAdmin` interface. Runtime consumers therefore do not need
+administrative methods, while operational tooling can use one contract across
+all supported brokers.
+
 ### Pipeline Actions
 
 Message handlers return a `models.PipelineAction`. The queue client maps that
@@ -81,6 +86,114 @@ action to broker operations:
 
 All providers implement at-least-once processing. Handlers and downstream
 writes should therefore be idempotent.
+
+## Dead-Letter Envelopes
+
+`AddToDeadletter` stores a versioned `uug.ai/dead-letter/v1` envelope containing:
+
+- The exact original payload, encoded safely even when it is not valid JSON
+- The source queue or topic
+- The dead-letter destination
+- The failure reason, attempt count, and UTC timestamp
+- Optional service and provider-neutral attributes
+
+For compatibility with existing services, calling `Publish` with the configured
+dead-letter destination is also enveloped automatically. Existing callers do not
+need to migrate in lockstep to start recording their source queue. Runtime
+payloads are always wrapped, even if their JSON resembles an envelope, so payload
+data cannot choose its own replay destination. Administrative tools that need to
+set source metadata use `DeadLetterAdmin.PublishDeadLetter`.
+
+Existing raw dead-letter messages remain readable. They are reported with the
+source `unknown` and require an explicit replay destination because the library
+cannot safely infer where they came from.
+
+## Inspecting and Replaying Dead-Letter Messages
+
+Install or run the repository CLI and select the provider:
+
+```bash
+go run . dlq inspect \
+  --provider rabbitmq \
+  --dead-letter dead-letter-queue \
+  --limit 100
+```
+
+Inspection prints counts grouped by recorded source queue, including the oldest
+and newest envelope timestamps. Filter the report with `--source`.
+
+Replay is a dry run by default:
+
+```bash
+go run . dlq replay \
+  --provider rabbitmq \
+  --dead-letter dead-letter-queue \
+  --source kcloud-monitor-queue \
+  --limit 100
+```
+
+Add `--execute` to publish and settle matched messages. The recorded source is
+the default destination for envelope messages. Use `--destination` to override
+it or to route legacy messages:
+
+```bash
+go run . dlq replay \
+  --provider sqs \
+  --dead-letter dead-letter-queue \
+  --destination kcloud-monitor-queue \
+  --limit 100 \
+  --execute
+```
+
+The CLI refuses to replay to the configured dead-letter destination. It always
+publishes first and settles the source message only after broker acknowledgement:
+
+- RabbitMQ uses a dedicated confirm-mode channel, then acknowledges the delivery.
+- SQS waits for `SendMessage`, then deletes the message using its receipt handle.
+- Kafka and Azure Event Hubs wait for delivery, then commit the source offset.
+
+Kafka offsets are contiguous, so executed Kafka/Event Hubs replays do not accept
+`--source`. They route each envelope to its recorded source and stop before an
+unroutable legacy message. Use `--destination` to replay a legacy range.
+
+Inspection is non-destructive but not side-effect-free: RabbitMQ deliveries are
+requeued and SQS visibility is reset after scanning, which may affect ordering
+and redelivery metadata. Kafka/Event Hubs inspection uses a unique consumer
+group and does not commit offsets. Always use a dedicated administrative client,
+set a bounded `--limit`, and expect at-least-once delivery if publishing succeeds
+but settlement fails.
+
+Provider connection flags use their matching environment variables where
+possible:
+
+| Provider | Required settings |
+| --- | --- |
+| RabbitMQ | `RABBITMQ_HOST`, `RABBITMQ_USERNAME`, `RABBITMQ_PASSWORD` |
+| Kafka | `KAFKA_BROKER`; optional SASL settings and `KAFKA_GROUP_ID` |
+| Azure Event Hubs | `AZURE_EVENTHUB_CONNECTION_STRING` and an existing dedicated `KAFKA_GROUP_ID`; optional namespace |
+| SQS | `AWS_REGION` and the standard AWS credential chain |
+
+Run `go run . dlq inspect --help` or `go run . dlq replay --help` for all flags.
+
+### Seeding Synthetic Messages
+
+Use the guarded seed command to exercise a non-production DLQ. It is a dry run
+unless `--execute` is present:
+
+```bash
+go run . dlq seed \
+  --provider rabbitmq \
+  --dead-letter test-dead-letter-queue \
+  --sources test-monitor-queue,test-analysis-queue \
+  --count 10
+
+# Publish the synthetic envelopes
+go run . dlq seed ... --execute
+```
+
+Synthetic payloads contain only a sequence number and source name. The command
+does not read application data. Use dedicated test queues: replaying seeded
+messages will publish those payloads to their recorded source destinations.
 
 ## Choosing a Broker
 

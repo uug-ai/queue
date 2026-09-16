@@ -32,6 +32,10 @@ type SQSClient interface {
 	ChangeMessageVisibility(context.Context, *awssqs.ChangeMessageVisibilityInput, ...func(*awssqs.Options)) (*awssqs.ChangeMessageVisibilityOutput, error)
 }
 
+type sqsVisibilityBatchClient interface {
+	ChangeMessageVisibilityBatch(context.Context, *awssqs.ChangeMessageVisibilityBatchInput, ...func(*awssqs.Options)) (*awssqs.ChangeMessageVisibilityBatchOutput, error)
+}
+
 // SQS implements QueueInterface using the AWS SDK for Go v2.
 type SQS struct {
 	options                 *SQSOptions
@@ -169,6 +173,9 @@ func (s *SQS) queueURL(ctx context.Context, queueName string) (string, error) {
 }
 
 func (s *SQS) Publish(queueName string, payload []byte) error {
+	if queueName == s.options.DeadletterQueue {
+		return s.addToDeadletter(payload, DeadLetterReasonUnspecified, 0)
+	}
 	err := s.publish(queueName, payload, 0)
 	if err != nil {
 		_ = s.DisasterRecovery(payload)
@@ -177,6 +184,14 @@ func (s *SQS) Publish(queueName string, payload []byte) error {
 }
 
 func (s *SQS) PublishWithDelay(queueName string, payload []byte, backoff int) {
+	if queueName == s.options.DeadletterQueue {
+		envelope, err := s.deadLetterEnvelope(payload, DeadLetterReasonUnspecified, 0)
+		if err != nil {
+			_ = s.DisasterRecovery(payload)
+			return
+		}
+		payload = envelope
+	}
 	if err := s.publish(queueName, payload, int32(backoff)); err != nil {
 		_ = s.DisasterRecovery(payload)
 	}
@@ -252,7 +267,7 @@ func (s *SQS) ReadMessages(handleMessage models.MessageHandler, handlePrometheus
 		payload := []byte(aws.ToString(message.Body))
 		var event models.PipelineEvent
 		if err := json.Unmarshal(payload, &event); err != nil {
-			return s.deadletterAndDelete(ctx, message, payload)
+			return s.deadletterAndDelete(ctx, message, payload, DeadLetterReasonMalformed, 0)
 		}
 
 		receiveCount := sqsReceiveCount(message)
@@ -269,7 +284,7 @@ func (s *SQS) ReadMessages(handleMessage models.MessageHandler, handlePrometheus
 			var forwardPayload []byte
 			forwardPayload, err = json.Marshal(event)
 			if err != nil {
-				err = s.deadletterAndDelete(ctx, message, payload)
+				err = s.deadletterAndDelete(ctx, message, payload, DeadLetterReasonMalformed, 0)
 			} else {
 				err = s.publishThenDelete(ctx, message, s.options.RouterQueue, forwardPayload)
 			}
@@ -278,7 +293,7 @@ func (s *SQS) ReadMessages(handleMessage models.MessageHandler, handlePrometheus
 			if marshalErr != nil {
 				deadletterPayload = payload
 			}
-			err = s.deadletterAndDelete(ctx, message, deadletterPayload)
+			err = s.deadletterAndDelete(ctx, message, deadletterPayload, DeadLetterReasonHandlerError, 0)
 		case models.PipelineRetry:
 			err = s.retryOrDeadletter(ctx, message, payload, receiveCount, backoff)
 		default:
@@ -297,7 +312,7 @@ func (s *SQS) RouteMessages(_ models.MessageHandler, handlePrometheus models.Pro
 		payload := []byte(aws.ToString(message.Body))
 		var event models.PipelineEvent
 		if err := json.Unmarshal(payload, &event); err != nil {
-			return s.deadletterAndDelete(ctx, message, payload)
+			return s.deadletterAndDelete(ctx, message, payload, DeadLetterReasonMalformed, 0)
 		}
 		var err error
 		if len(event.Stages) == 0 {
@@ -321,7 +336,7 @@ func (s *SQS) ReadRawMessages(handleMessage RawMessageHandler, handlePrometheus 
 		switch action {
 		case models.PipelineForward:
 			if s.options.RouterQueue == "" {
-				err = s.deadletterAndDelete(ctx, message, payload)
+				err = s.deadletterAndDelete(ctx, message, payload, DeadLetterReasonPublishFailed, 0)
 				break
 			}
 			if output == nil {
@@ -329,7 +344,7 @@ func (s *SQS) ReadRawMessages(handleMessage RawMessageHandler, handlePrometheus 
 			}
 			err = s.publishThenDelete(ctx, message, s.options.RouterQueue, output)
 		case models.PipelineError:
-			err = s.deadletterAndDelete(ctx, message, payload)
+			err = s.deadletterAndDelete(ctx, message, payload, DeadLetterReasonHandlerError, 0)
 		case models.PipelineRetry:
 			err = s.retryOrDeadletter(ctx, message, payload, sqsReceiveCount(message), backoff)
 		default:
@@ -384,7 +399,7 @@ func (s *SQS) retryOrDeadletter(ctx context.Context, message types.Message, payl
 	// ApproximateReceiveCount includes the initial delivery. MaxRetries counts
 	// only retries, matching the retry contract used by the other providers.
 	if receiveCount > s.options.maxRetries() {
-		return s.deadletterAndDelete(ctx, message, payload)
+		return s.deadletterAndDelete(ctx, message, payload, DeadLetterReasonRetryExhausted, receiveCount-1)
 	}
 	if backoff <= 0 {
 		backoff = 5
@@ -403,7 +418,7 @@ func (s *SQS) retryOrDeadletter(ctx context.Context, message types.Message, payl
 
 func (s *SQS) publishThenDelete(ctx context.Context, message types.Message, queueName string, payload []byte) error {
 	if queueName == "" {
-		return s.deadletterAndDelete(ctx, message, payload)
+		return s.deadletterAndDelete(ctx, message, payload, DeadLetterReasonPublishFailed, 0)
 	}
 	if err := s.Publish(queueName, payload); err != nil {
 		return err
@@ -411,8 +426,8 @@ func (s *SQS) publishThenDelete(ctx context.Context, message types.Message, queu
 	return s.deleteMessage(ctx, message)
 }
 
-func (s *SQS) deadletterAndDelete(ctx context.Context, message types.Message, payload []byte) error {
-	if err := s.AddToDeadletter(payload); err != nil {
+func (s *SQS) deadletterAndDelete(ctx context.Context, message types.Message, payload []byte, reason DeadLetterReason, attempts int) error {
+	if err := s.addToDeadletter(payload, reason, attempts); err != nil {
 		return err
 	}
 	return s.deleteMessage(ctx, message)
@@ -431,7 +446,24 @@ func (s *SQS) deleteMessage(ctx context.Context, message types.Message) error {
 }
 
 func (s *SQS) AddToDeadletter(payload []byte) error {
-	return s.Publish(s.options.DeadletterQueue, payload)
+	return s.addToDeadletter(payload, DeadLetterReasonUnspecified, 0)
+}
+
+func (s *SQS) addToDeadletter(payload []byte, reason DeadLetterReason, attempts int) error {
+	envelope, err := s.deadLetterEnvelope(payload, reason, attempts)
+	if err != nil {
+		return err
+	}
+	return s.publish(s.options.DeadletterQueue, envelope, 0)
+}
+
+func (s *SQS) deadLetterEnvelope(payload []byte, reason DeadLetterReason, attempts int) ([]byte, error) {
+	return encodeDeadLetter(payload, DeadLetterMetadata{
+		Source:      s.options.ConsumerQueue,
+		Destination: s.options.DeadletterQueue,
+		Reason:      reason,
+		Attempts:    attempts,
+	})
 }
 
 func (s *SQS) SetDisasterRecoveryHandler(handler DisasterRecoveryHandler) {
