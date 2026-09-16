@@ -72,6 +72,11 @@ Dead-letter inspection and replay are deliberately exposed through the separate
 administrative methods, while operational tooling can use one contract across
 all supported brokers.
 
+RabbitMQ services that need to deliberately park raw deliveries for operational
+testing can enable confirmed delivery and call `ReadMessagesToDeadletter`. The
+method preserves the original body and acknowledges it only after the broker
+confirms the dead-letter envelope.
+
 ### Pipeline Actions
 
 Message handlers return a `models.PipelineAction`. The queue client maps that

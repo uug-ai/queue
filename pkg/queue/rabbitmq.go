@@ -46,9 +46,8 @@ type RabbitOptions struct {
 	VirtualHost           string
 
 	// MaxRetries caps how many times a PipelineRetry re-queues a message before
-	// it is parked on the deadletter queue; zero selects defaultMaxRetries. It is
-	// the hard stop that keeps a permanently failing payload from looping the
-	// consumer queue forever (see retryOrDeadletter).
+	// it is parked on the deadletter queue. Zero preserves the historical
+	// unlimited retry behavior.
 	MaxRetries int
 
 	// TLS configuration for secure connections (e.g., AWS Amazon MQ)
@@ -154,9 +153,7 @@ func (b *RabbitOptionsBuilder) SetPrefetchCount(count int) *RabbitOptionsBuilder
 }
 
 // SetMaxRetries caps how many times a PipelineRetry re-queues a message before
-// it is dead-lettered. Zero (the default) selects defaultMaxRetries. Set it to
-// bound how long a transient sink failure is retried before the message is
-// parked for inspection instead of being requeued forever.
+// it is dead-lettered. Zero (the default) preserves unlimited retries.
 func (b *RabbitOptionsBuilder) SetMaxRetries(maxRetries int) *RabbitOptionsBuilder {
 	b.options.MaxRetries = maxRetries
 	return b
@@ -1282,18 +1279,12 @@ func (r *RabbitMQ) publishWithDelayHeaders(queueName string, payload []byte, bac
 // first delivery (count 0) and set explicitly on every re-queue.
 const retryCountHeader = "x-retry-count"
 
-// defaultMaxRetries bounds PipelineRetry re-queues when RabbitOptions.MaxRetries
-// is unset. With the default 5s backoff this rides out a brief sink outage
-// (~50s) before the message is dead-lettered instead of looping forever.
+// defaultMaxRetries preserves the bounded defaults used by Kafka and SQS.
 const defaultMaxRetries = 10
 
-// maxRetries returns the configured PipelineRetry cap, or defaultMaxRetries when
-// unset.
+// maxRetries returns the configured PipelineRetry cap. Zero means unlimited.
 func (r *RabbitMQ) maxRetries() int {
-	if r.options.MaxRetries > 0 {
-		return r.options.MaxRetries
-	}
-	return defaultMaxRetries
+	return r.options.MaxRetries
 }
 
 // retryCount reads the x-retry-count header off a delivery, tolerating the
@@ -1324,7 +1315,7 @@ func retryCount(headers amqp.Table) int {
 // after this returns nil, so a failed retry publish cannot silently lose it.
 func (r *RabbitMQ) retryOrDeadletter(headers amqp.Table, payload []byte, backoff time.Duration, publish func(string, []byte, amqp.Table) error) error {
 	attempts := retryCount(headers)
-	if attempts >= r.maxRetries() {
+	if maxRetries := r.maxRetries(); maxRetries > 0 && attempts >= maxRetries {
 		envelope, err := r.deadLetterEnvelope(payload, DeadLetterReasonRetryExhausted, attempts)
 		if err != nil {
 			return err

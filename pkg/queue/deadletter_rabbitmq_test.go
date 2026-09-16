@@ -3,6 +3,7 @@ package queue
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -152,6 +153,24 @@ func TestRabbitPublishDeadLetterUsesTrustedAdministrativeMetadata(t *testing.T) 
 	}
 	if message.DeadLetter.Source != "events" || string(message.Payload) != "payload" {
 		t.Fatalf("dead-letter message = %+v", message)
+	}
+}
+
+func TestRabbitReadMessagesToDeadletterRequiresConfirmedDelivery(t *testing.T) {
+	client, err := NewRabbitMQ(NewRabbitOptions().
+		SetConsumerQueue("events").
+		SetDeadletterQueue("deadletter").
+		SetHost("rabbitmq:5672").
+		SetUsername("guest").
+		SetPassword("guest").
+		Build())
+	if err != nil {
+		t.Fatalf("NewRabbitMQ: %v", err)
+	}
+
+	err = client.ReadMessagesToDeadletter(DeadLetterReasonHandlerError)
+	if err == nil || !strings.Contains(err.Error(), "confirmed RabbitMQ delivery is not enabled") {
+		t.Fatalf("error = %v, want confirmed delivery requirement", err)
 	}
 }
 

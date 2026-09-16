@@ -25,6 +25,45 @@ func (r *RabbitMQ) PublishDeadLetter(ctx context.Context, payload []byte, metada
 	return r.publishDeadLetterConfirmed(ctx, r.options.DeadletterQueue, envelope)
 }
 
+// ReadMessagesToDeadletter transfers raw consumer deliveries into versioned
+// dead-letter envelopes. Each source delivery is acknowledged only after the
+// broker confirms the dead-letter publish.
+func (r *RabbitMQ) ReadMessagesToDeadletter(reason DeadLetterReason) error {
+	if err := r.requireConfirmedDelivery(); err != nil {
+		return err
+	}
+	if reason == "" {
+		reason = DeadLetterReasonUnspecified
+	}
+	if err := r.ensureConnected(); err != nil {
+		return err
+	}
+	consumer := r.currentConsumer()
+	if consumer == nil {
+		return fmt.Errorf("RabbitMQ consumer channel is not initialized")
+	}
+	deliveries, err := consumer.Consume(
+		r.options.ConsumerQueue,
+		"",
+		false,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	for delivery := range deliveries {
+		if err := r.settleTransferredDelivery(delivery, func() error {
+			return r.addToDeadletterConfirmed(delivery.Body, reason)
+		}); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("RabbitMQ consumer channel closed")
+}
+
 func (r *RabbitMQ) InspectDeadLetters(ctx context.Context, request DeadLetterInspectRequest) (DeadLetterInspectResult, error) {
 	var result DeadLetterInspectResult
 	if err := validateDeadLetterLimit(request.Limit); err != nil {
