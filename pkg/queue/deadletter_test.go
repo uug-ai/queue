@@ -10,10 +10,11 @@ func TestDeadLetterEnvelopeRoundTripPreservesMalformedPayload(t *testing.T) {
 	payload := []byte{0xff, 0x00, '{'}
 	timestamp := time.Date(2026, 9, 16, 9, 48, 15, 0, time.UTC)
 	encoded, err := encodeDeadLetter(payload, DeadLetterMetadata{
-		Source:      "events",
-		Destination: "deadletter",
-		Reason:      DeadLetterReasonMalformed,
-		Timestamp:   timestamp,
+		Source:            "events",
+		Destination:       "deadletter",
+		ReplayDestination: "router",
+		Reason:            DeadLetterReasonMalformed,
+		Timestamp:         timestamp,
 	})
 	if err != nil {
 		t.Fatalf("encodeDeadLetter: %v", err)
@@ -25,7 +26,9 @@ func TestDeadLetterEnvelopeRoundTripPreservesMalformedPayload(t *testing.T) {
 	if message.Legacy || !bytes.Equal(message.Payload, payload) {
 		t.Fatalf("decoded message = %+v", message)
 	}
-	if message.DeadLetter.Source != "events" || message.DeadLetter.Timestamp != timestamp {
+	if message.DeadLetter.Source != "events" ||
+		message.DeadLetter.ReplayDestination != "router" ||
+		message.DeadLetter.Timestamp != timestamp {
 		t.Fatalf("decoded metadata = %+v", message.DeadLetter)
 	}
 }
@@ -102,5 +105,62 @@ func TestReplayPlanRequiresDestinationForLegacyMessage(t *testing.T) {
 	}
 	if plan.destination != "" || result.Unroutable != 1 || result.Retained != 1 {
 		t.Fatalf("plan = %+v, result = %+v", plan, result)
+	}
+}
+
+func TestReplayPlanDestinationPrecedence(t *testing.T) {
+	message := DeadLetterMessage{
+		ID: "message-1",
+		DeadLetter: DeadLetterMetadata{
+			Source:            "sequence",
+			ReplayDestination: "event",
+		},
+	}
+	tests := []struct {
+		name        string
+		request     DeadLetterReplayRequest
+		destination string
+	}{
+		{
+			name:        "recorded router",
+			request:     DeadLetterReplayRequest{Limit: 1},
+			destination: "event",
+		},
+		{
+			name:        "explicit override",
+			request:     DeadLetterReplayRequest{Limit: 1, Destination: "manual"},
+			destination: "manual",
+		},
+		{
+			name:        "older envelope fallback",
+			request:     DeadLetterReplayRequest{Limit: 1},
+			destination: "sequence",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			replayMessage := message
+			if test.name == "older envelope fallback" {
+				replayMessage.DeadLetter.ReplayDestination = ""
+			}
+			var result DeadLetterReplayResult
+			plan, err := planDeadLetterReplay(&result, replayMessage, test.request, "deadletter")
+			if err != nil {
+				t.Fatalf("planDeadLetterReplay: %v", err)
+			}
+			if plan.destination != test.destination ||
+				result.Planned != 1 ||
+				result.Destinations[test.destination] != 1 {
+				t.Fatalf("plan = %+v, result = %+v", plan, result)
+			}
+		})
+	}
+}
+
+func TestRuntimeDeadLetterMetadataFallsBackToSourceWithoutRouter(t *testing.T) {
+	metadata := runtimeDeadLetterMetadata("sequence", "deadletter", "", DeadLetterReasonHandlerError, 2)
+	if metadata.ReplayDestination != "sequence" {
+		t.Fatalf("replay destination = %q, want sequence", metadata.ReplayDestination)
 	}
 }

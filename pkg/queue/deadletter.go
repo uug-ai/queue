@@ -25,13 +25,14 @@ const (
 
 // DeadLetterMetadata describes where and why a message was parked.
 type DeadLetterMetadata struct {
-	Source      string            `json:"source,omitempty"`
-	Destination string            `json:"destination"`
-	Service     string            `json:"service,omitempty"`
-	Reason      DeadLetterReason  `json:"reason"`
-	Attempts    int               `json:"attempts,omitempty"`
-	Timestamp   time.Time         `json:"timestamp"`
-	Attributes  map[string]string `json:"attributes,omitempty"`
+	Source            string            `json:"source,omitempty"`
+	Destination       string            `json:"destination"`
+	ReplayDestination string            `json:"replayDestination,omitempty"`
+	Service           string            `json:"service,omitempty"`
+	Reason            DeadLetterReason  `json:"reason"`
+	Attempts          int               `json:"attempts,omitempty"`
+	Timestamp         time.Time         `json:"timestamp"`
+	Attributes        map[string]string `json:"attributes,omitempty"`
 }
 
 // DeadLetterEnvelope is the provider-independent format stored on dead-letter
@@ -79,13 +80,14 @@ type DeadLetterReplayRequest struct {
 }
 
 type DeadLetterReplayResult struct {
-	Scanned    int
-	Matched    int
-	Planned    int
-	Replayed   int
-	Retained   int
-	Legacy     int
-	Unroutable int
+	Scanned      int
+	Matched      int
+	Planned      int
+	Replayed     int
+	Retained     int
+	Legacy       int
+	Unroutable   int
+	Destinations map[string]int
 }
 
 // DeadLetterAdmin is intentionally separate from QueueInterface: applications
@@ -111,6 +113,20 @@ func encodeDeadLetter(payload []byte, metadata DeadLetterMetadata) ([]byte, erro
 		Payload:    append([]byte(nil), payload...),
 		DeadLetter: metadata,
 	})
+}
+
+func runtimeDeadLetterMetadata(source, deadLetterDestination, routerDestination string, reason DeadLetterReason, attempts int) DeadLetterMetadata {
+	replayDestination := strings.TrimSpace(routerDestination)
+	if replayDestination == "" {
+		replayDestination = strings.TrimSpace(source)
+	}
+	return DeadLetterMetadata{
+		Source:            source,
+		Destination:       deadLetterDestination,
+		ReplayDestination: replayDestination,
+		Reason:            reason,
+		Attempts:          attempts,
+	}
 }
 
 func encodeDeadLetterForDestination(payload []byte, metadata DeadLetterMetadata, destination string) ([]byte, error) {
@@ -237,7 +253,10 @@ func planDeadLetterReplay(result *DeadLetterReplayResult, message DeadLetterMess
 	result.Matched++
 	destination := strings.TrimSpace(request.Destination)
 	if destination == "" && !message.Legacy {
-		destination = strings.TrimSpace(message.DeadLetter.Source)
+		destination = strings.TrimSpace(message.DeadLetter.ReplayDestination)
+		if destination == "" {
+			destination = strings.TrimSpace(message.DeadLetter.Source)
+		}
 	}
 	if destination == "" {
 		result.Unroutable++
@@ -248,6 +267,10 @@ func planDeadLetterReplay(result *DeadLetterReplayResult, message DeadLetterMess
 		return deadLetterReplayPlan{}, fmt.Errorf("refusing to replay dead-letter message %q back to %q", message.ID, deadLetterDestination)
 	}
 	result.Planned++
+	if result.Destinations == nil {
+		result.Destinations = make(map[string]int)
+	}
+	result.Destinations[destination]++
 	if !request.Execute {
 		result.Retained++
 	}

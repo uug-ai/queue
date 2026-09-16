@@ -99,6 +99,8 @@ writes should therefore be idempotent.
 - The exact original payload, encoded safely even when it is not valid JSON
 - The source queue or topic
 - The dead-letter destination
+- The replay destination: the configured pipeline router, or the source when no
+  router is configured
 - The failure reason, attempt count, and UTC timestamp
 - Optional service and provider-neutral attributes
 
@@ -112,6 +114,12 @@ set source metadata use `DeadLetterAdmin.PublishDeadLetter`.
 Existing raw dead-letter messages remain readable. They are reported with the
 source `unknown` and require an explicit replay destination because the library
 cannot safely infer where they came from.
+
+Replay prefers an operator-supplied destination, then the destination recorded
+in the envelope, and finally the source queue for envelopes written before
+`replayDestination` was introduced. Pipeline workers therefore replay through
+their configured router, which resolves the next queue from the event's
+remaining stages, while non-pipeline workers preserve source-queue behavior.
 
 ## Inspecting and Replaying Dead-Letter Messages
 

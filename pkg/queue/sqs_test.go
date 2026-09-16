@@ -121,6 +121,21 @@ func TestSQSDeadLetterReplaySendsBeforeDelete(t *testing.T) {
 	}
 }
 
+func TestSQSDeadLetterEnvelopeRecordsRouter(t *testing.T) {
+	client, _ := newTestSQS(t, types.Message{})
+	envelope, err := client.deadLetterEnvelope([]byte("payload"), DeadLetterReasonHandlerError, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := decodeDeadLetter("message-1", envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.DeadLetter.Source != "events" || message.DeadLetter.ReplayDestination != "router" {
+		t.Fatalf("dead-letter metadata = %+v", message.DeadLetter)
+	}
+}
+
 func TestSQSDeadLetterInspectReleasesMessages(t *testing.T) {
 	message := types.Message{
 		MessageId:     aws.String("legacy-1"),

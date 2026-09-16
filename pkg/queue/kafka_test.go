@@ -121,6 +121,23 @@ func newTestKafka(t *testing.T, message *kafka.Message) (*Kafka, *fakeKafkaConsu
 	return client, consumer, producer
 }
 
+func TestKafkaDeadLetterEnvelopeRecordsRouter(t *testing.T) {
+	client, _, producer := newTestKafka(t, nil)
+	if err := client.addToDeadletter([]byte("payload"), DeadLetterReasonHandlerError, 0); err != nil {
+		t.Fatal(err)
+	}
+	if len(producer.messages) != 1 {
+		t.Fatalf("published messages = %d, want 1", len(producer.messages))
+	}
+	message, err := decodeDeadLetter("message-1", producer.messages[0].Value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.DeadLetter.Source != "events" || message.DeadLetter.ReplayDestination != "router" {
+		t.Fatalf("dead-letter metadata = %+v", message.DeadLetter)
+	}
+}
+
 func TestKafkaDeadLetterReplayPublishesBeforeCommit(t *testing.T) {
 	envelope, err := encodeDeadLetter([]byte("payload"), DeadLetterMetadata{
 		Source:      "events",

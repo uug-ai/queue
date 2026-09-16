@@ -90,6 +90,7 @@ func TestRabbitDeadLetterReplayPublishesBeforeAck(t *testing.T) {
 func TestRabbitPublishToDeadLetterQueueAddsEnvelope(t *testing.T) {
 	client, err := NewRabbitMQ(NewRabbitOptions().
 		SetConsumerQueue("events").
+		SetRouterQueue("router").
 		SetDeadletterQueue("deadletter").
 		SetHost("rabbitmq:5672").
 		SetUsername("guest").
@@ -114,7 +115,10 @@ func TestRabbitPublishToDeadLetterQueueAddsEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if message.Legacy || message.DeadLetter.Source != "events" || string(message.Payload) != "payload" {
+	if message.Legacy ||
+		message.DeadLetter.Source != "events" ||
+		message.DeadLetter.ReplayDestination != "router" ||
+		string(message.Payload) != "payload" {
 		t.Fatalf("dead-letter message = %+v", message)
 	}
 }
@@ -177,6 +181,7 @@ func TestRabbitReadMessagesToDeadletterRequiresConfirmedDelivery(t *testing.T) {
 func TestRabbitDeadLetterEnvelopePreservesFailureReason(t *testing.T) {
 	client, err := NewRabbitMQ(NewRabbitOptions().
 		SetConsumerQueue("events").
+		SetRouterQueue("router").
 		SetDeadletterQueue("deadletter").
 		SetHost("rabbitmq:5672").
 		SetUsername("guest").
@@ -202,6 +207,9 @@ func TestRabbitDeadLetterEnvelopePreservesFailureReason(t *testing.T) {
 			}
 			if message.DeadLetter.Reason != reason {
 				t.Fatalf("reason = %q, want %q", message.DeadLetter.Reason, reason)
+			}
+			if message.DeadLetter.ReplayDestination != "router" {
+				t.Fatalf("replay destination = %q, want router", message.DeadLetter.ReplayDestination)
 			}
 		})
 	}

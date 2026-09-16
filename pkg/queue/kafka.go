@@ -389,12 +389,13 @@ func (k *Kafka) AddToDeadletter(payload []byte) error {
 }
 
 func (k *Kafka) addToDeadletter(payload []byte, reason DeadLetterReason, attempts int) error {
-	envelope, err := encodeDeadLetter(payload, DeadLetterMetadata{
-		Source:      k.options.ConsumerTopic,
-		Destination: k.options.DeadletterTopic,
-		Reason:      reason,
-		Attempts:    attempts,
-	})
+	envelope, err := encodeDeadLetter(payload, runtimeDeadLetterMetadata(
+		k.options.ConsumerTopic,
+		k.options.DeadletterTopic,
+		k.options.RouterTopic,
+		reason,
+		attempts,
+	))
 	if err != nil {
 		return err
 	}
