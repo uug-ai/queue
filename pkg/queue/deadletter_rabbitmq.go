@@ -105,7 +105,7 @@ func (r *RabbitMQ) InspectDeadLetters(ctx context.Context, request DeadLetterIns
 
 func (r *RabbitMQ) ReplayDeadLetters(ctx context.Context, request DeadLetterReplayRequest) (DeadLetterReplayResult, error) {
 	var result DeadLetterReplayResult
-	if err := validateDeadLetterLimit(request.Limit); err != nil {
+	if err := validateDeadLetterReplayRequest(request); err != nil {
 		return result, err
 	}
 	if r.deadLetterGet == nil || r.deadLetterReplayPublish == nil {
@@ -123,51 +123,79 @@ func (r *RabbitMQ) ReplayDeadLetters(ctx context.Context, request DeadLetterRepl
 		message  DeadLetterMessage
 		plan     deadLetterReplayPlan
 	}
-	items := make([]replayItem, 0, request.Limit)
+	batchSize := deadLetterReplayBatchSize(request)
 	for result.Scanned < request.Limit {
-		if err := ctx.Err(); err != nil {
-			return result, requeueRetained(err)
+		batchCtx, cancelBatch := deadLetterReplayBatchContext(ctx, request.BatchTimeout)
+		items := make([]replayItem, 0, batchSize)
+		batchScanned := 0
+		exhausted := false
+		for batchScanned < batchSize && result.Scanned < request.Limit {
+			if err := batchCtx.Err(); err != nil {
+				cancelBatch()
+				return result, requeueRetained(err)
+			}
+			delivery, ok, err := r.getDeadLetter()
+			if err != nil {
+				cancelBatch()
+				return result, requeueRetained(err)
+			}
+			if !ok {
+				exhausted = true
+				break
+			}
+			batchScanned++
+			retained = append(retained, delivery)
+			decoded, err := decodeDeadLetter(rabbitDeadLetterID(delivery), delivery.Body)
+			if err != nil {
+				cancelBatch()
+				return result, requeueRetained(err)
+			}
+			plan, err := planDeadLetterReplay(&result, decoded, request, r.options.DeadletterQueue)
+			if err != nil {
+				cancelBatch()
+				return result, requeueRetained(err)
+			}
+			if plan.destination != "" {
+				items = append(items, replayItem{delivery: delivery, message: decoded, plan: plan})
+			}
 		}
-		delivery, ok, err := r.getDeadLetter()
-		if err != nil {
-			return result, requeueRetained(err)
-		}
-		if !ok {
-			break
-		}
-		retained = append(retained, delivery)
-		decoded, err := decodeDeadLetter(rabbitDeadLetterID(delivery), delivery.Body)
-		if err != nil {
-			return result, requeueRetained(err)
-		}
-		plan, err := planDeadLetterReplay(&result, decoded, request, r.options.DeadletterQueue)
-		if err != nil {
-			return result, requeueRetained(err)
-		}
-		if plan.destination == "" {
-			continue
-		}
-		items = append(items, replayItem{delivery: delivery, message: decoded, plan: plan})
-	}
 
-	messages := make([]DeadLetterMessage, len(items))
-	for index := range items {
-		messages[index] = items[index].message
-	}
-	payloads, err := transformDeadLetterReplayMessages(ctx, request.Transform, messages)
-	if err != nil {
-		return result, requeueRetained(err)
-	}
-	if request.Execute {
+		messages := make([]DeadLetterMessage, len(items))
+		for index := range items {
+			messages[index] = items[index].message
+		}
+		transformations, err := transformDeadLetterReplayMessages(batchCtx, request.Transform, messages)
+		if err != nil {
+			cancelBatch()
+			return result, requeueRetained(err)
+		}
 		for index, item := range items {
-			if err := r.publishDeadLetterConfirmed(ctx, item.plan.destination, payloads[index]); err != nil {
+			if transformations[index].Skip {
+				skipDeadLetterReplay(&result, item.plan.destination, request.Execute)
+				continue
+			}
+			if !request.Execute {
+				continue
+			}
+			if err := r.publishDeadLetterConfirmed(batchCtx, item.plan.destination, transformations[index].Payload); err != nil {
+				cancelBatch()
 				return result, requeueRetained(fmt.Errorf("replay RabbitMQ dead-letter message %q: %w", item.message.ID, err))
 			}
 			if err := item.delivery.Ack(false); err != nil {
+				cancelBatch()
 				return result, requeueRetained(fmt.Errorf("settle replayed RabbitMQ dead-letter message %q: %w", item.message.ID, err))
 			}
 			retained = removeRabbitDeadLetter(retained, item.delivery.DeliveryTag)
 			result.Replayed++
+		}
+		cancelBatch()
+		if exhausted || result.Scanned >= request.Limit {
+			break
+		}
+		if request.Execute {
+			if err := waitForDeadLetterReplayBatch(ctx, request.BatchDelay); err != nil {
+				return result, requeueRetained(err)
+			}
 		}
 	}
 	if err := r.restoreRabbitDeadLetters(retained); err != nil {
@@ -271,8 +299,8 @@ func (r *RabbitMQ) restoreRabbitDeadLetters(deliveries []amqp.Delivery) error {
 		}
 		err := r.publishDeadLetterConfirmed(ctx, r.options.DeadletterQueue, delivery.Body)
 		if err != nil {
-			nackErr := delivery.Nack(false, true)
 			result = errors.Join(result, fmt.Errorf("republish retained RabbitMQ dead-letter message: %w", err))
+			nackErr := delivery.Nack(false, true)
 			if nackErr != nil {
 				result = errors.Join(result, fmt.Errorf("requeue retained RabbitMQ dead-letter message: %w", nackErr))
 			}

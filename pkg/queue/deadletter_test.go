@@ -171,26 +171,53 @@ func TestTransformDeadLetterReplayMessages(t *testing.T) {
 		{ID: "one", Payload: []byte("first")},
 		{ID: "two", Payload: []byte("second")},
 	}
-	payloads, err := transformDeadLetterReplayMessages(context.Background(), func(_ context.Context, got []DeadLetterMessage) ([][]byte, error) {
+	transformations, err := transformDeadLetterReplayMessages(context.Background(), func(_ context.Context, got []DeadLetterMessage) ([]DeadLetterReplayTransformation, error) {
 		if len(got) != 2 || got[0].ID != "one" || got[1].ID != "two" {
 			t.Fatalf("messages = %+v", got)
 		}
-		return [][]byte{[]byte("transformed-first"), []byte("transformed-second")}, nil
+		return []DeadLetterReplayTransformation{
+			{Payload: []byte("transformed-first")},
+			{Payload: []byte("transformed-second")},
+		}, nil
 	}, messages)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(payloads[0], []byte("transformed-first")) ||
-		!bytes.Equal(payloads[1], []byte("transformed-second")) {
-		t.Fatalf("payloads = %q", payloads)
+	if !bytes.Equal(transformations[0].Payload, []byte("transformed-first")) ||
+		!bytes.Equal(transformations[1].Payload, []byte("transformed-second")) {
+		t.Fatalf("transformations = %+v", transformations)
 	}
 }
 
 func TestTransformDeadLetterReplayMessagesRequiresMatchingResultCount(t *testing.T) {
-	_, err := transformDeadLetterReplayMessages(context.Background(), func(context.Context, []DeadLetterMessage) ([][]byte, error) {
+	_, err := transformDeadLetterReplayMessages(context.Background(), func(context.Context, []DeadLetterMessage) ([]DeadLetterReplayTransformation, error) {
 		return nil, nil
 	}, []DeadLetterMessage{{ID: "one"}})
 	if err == nil {
 		t.Fatal("expected transform result count error")
+	}
+}
+
+func TestValidateDeadLetterReplayRequestAllowsLargeBatchedLimit(t *testing.T) {
+	if err := validateDeadLetterReplayRequest(DeadLetterReplayRequest{
+		Limit:        30000,
+		BatchSize:    100,
+		BatchDelay:   time.Second,
+		BatchTimeout: time.Minute,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateDeadLetterReplayRequest(DeadLetterReplayRequest{
+		Limit:     30000,
+		BatchSize: 0,
+	}); err == nil {
+		t.Fatal("expected the legacy unbatched limit to remain capped")
+	}
+	if err := validateDeadLetterReplayRequest(DeadLetterReplayRequest{
+		Limit:        1,
+		BatchSize:    1,
+		BatchTimeout: -time.Second,
+	}); err == nil {
+		t.Fatal("expected a negative batch timeout to be rejected")
 	}
 }

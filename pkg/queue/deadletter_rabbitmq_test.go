@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -79,11 +80,11 @@ func TestRabbitDeadLetterReplayPublishesBeforeAck(t *testing.T) {
 	result, err := client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
 		Limit:   1,
 		Execute: true,
-		Transform: func(_ context.Context, messages []DeadLetterMessage) ([][]byte, error) {
+		Transform: func(_ context.Context, messages []DeadLetterMessage) ([]DeadLetterReplayTransformation, error) {
 			if len(messages) != 1 || string(messages[0].Payload) != "payload" {
 				t.Fatalf("transform messages = %+v", messages)
 			}
-			return [][]byte{[]byte("transformed")}, nil
+			return []DeadLetterReplayTransformation{{Payload: []byte("transformed")}}, nil
 		},
 	})
 	if err != nil {
@@ -140,7 +141,7 @@ func TestRabbitDeadLetterReplayTransformFailureRestoresBatch(t *testing.T) {
 	_, err = client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
 		Limit:   1,
 		Execute: true,
-		Transform: func(context.Context, []DeadLetterMessage) ([][]byte, error) {
+		Transform: func(context.Context, []DeadLetterMessage) ([]DeadLetterReplayTransformation, error) {
 			return nil, errors.New("refresh failed")
 		},
 	})
@@ -149,6 +150,91 @@ func TestRabbitDeadLetterReplayTransformFailureRestoresBatch(t *testing.T) {
 	}
 	if eventPublishes != 0 || restored != 1 || len(acknowledger.acked) != 1 {
 		t.Fatalf("event publishes=%d restored=%d acknowledgements=%v", eventPublishes, restored, acknowledger.acked)
+	}
+}
+
+func TestRabbitDeadLetterReplayBatchesAndRetainsSkippedMessages(t *testing.T) {
+	client, err := NewRabbitMQ(NewRabbitOptions().
+		SetConsumerQueue("events").
+		SetDeadletterQueue("deadletter").
+		SetHost("rabbitmq:5672").
+		SetUsername("guest").
+		SetPassword("guest").
+		Build())
+	if err != nil {
+		t.Fatalf("NewRabbitMQ: %v", err)
+	}
+
+	acknowledger := &fakeRabbitAcknowledger{}
+	deliveries := make([]amqp.Delivery, 0, 5)
+	for index, payload := range []string{"one", "poison", "three", "four", "five"} {
+		envelope, encodeErr := encodeDeadLetter([]byte(payload), DeadLetterMetadata{
+			Source:      "events",
+			Destination: "deadletter",
+		})
+		if encodeErr != nil {
+			t.Fatal(encodeErr)
+		}
+		deliveries = append(deliveries, amqp.Delivery{
+			Acknowledger: acknowledger,
+			DeliveryTag:  uint64(index + 1),
+			Body:         envelope,
+		})
+	}
+	client.deadLetterGet = func() (amqp.Delivery, bool, error) {
+		if len(deliveries) == 0 {
+			return amqp.Delivery{}, false, nil
+		}
+		delivery := deliveries[0]
+		deliveries = deliveries[1:]
+		return delivery, true, nil
+	}
+	var batches []int
+	var replayed, restored []string
+	client.deadLetterReplayPublish = func(_ context.Context, destination string, payload []byte) error {
+		if destination == "events" {
+			replayed = append(replayed, string(payload))
+		} else if destination == "deadletter" {
+			message, decodeErr := decodeDeadLetter("restored", payload)
+			if decodeErr != nil {
+				t.Fatal(decodeErr)
+			}
+			restored = append(restored, string(message.Payload))
+		}
+		return nil
+	}
+
+	result, err := client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
+		Limit:     5,
+		BatchSize: 2,
+		Execute:   true,
+		Transform: func(_ context.Context, messages []DeadLetterMessage) ([]DeadLetterReplayTransformation, error) {
+			batches = append(batches, len(messages))
+			transformed := make([]DeadLetterReplayTransformation, len(messages))
+			for index, message := range messages {
+				if string(message.Payload) == "poison" {
+					transformed[index].Skip = true
+				} else {
+					transformed[index].Payload = append([]byte("fresh-"), message.Payload...)
+				}
+			}
+			return transformed, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ReplayDeadLetters: %v", err)
+	}
+	if !slices.Equal(batches, []int{2, 2, 1}) {
+		t.Fatalf("transform batch sizes = %v", batches)
+	}
+	if !slices.Equal(replayed, []string{"fresh-one", "fresh-three", "fresh-four", "fresh-five"}) ||
+		!slices.Equal(restored, []string{"poison"}) {
+		t.Fatalf("replayed=%v restored=%v", replayed, restored)
+	}
+	if result.Scanned != 5 || result.Matched != 5 || result.Planned != 4 ||
+		result.Replayed != 4 || result.Retained != 1 || result.Skipped != 1 ||
+		result.Destinations["events"] != 4 {
+		t.Fatalf("result = %+v", result)
 	}
 }
 

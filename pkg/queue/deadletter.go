@@ -72,19 +72,26 @@ type DeadLetterInspectResult struct {
 }
 
 type DeadLetterReplayRequest struct {
-	Limit       int
-	Source      string
-	Destination string
-	Execute     bool
-	IdleTimeout time.Duration
-	Transform   DeadLetterReplayTransformer
+	Limit        int
+	BatchSize    int
+	BatchDelay   time.Duration
+	BatchTimeout time.Duration
+	Source       string
+	Destination  string
+	Execute      bool
+	IdleTimeout  time.Duration
+	Transform    DeadLetterReplayTransformer
 }
 
-// DeadLetterReplayTransformer replaces payloads for a planned replay batch.
-// Implementations must return one payload for each input message, in the same
-// order. Queue providers still choose the trusted replay destination from the
-// envelope or request and settle messages only after publishing succeeds.
-type DeadLetterReplayTransformer func(context.Context, []DeadLetterMessage) ([][]byte, error)
+type DeadLetterReplayTransformation struct {
+	Payload []byte
+	Skip    bool
+}
+
+// DeadLetterReplayTransformer replaces or skips payloads for a planned replay
+// batch. Implementations must return one result for each input message, in the
+// same order. A skipped message remains on the dead-letter destination.
+type DeadLetterReplayTransformer func(context.Context, []DeadLetterMessage) ([]DeadLetterReplayTransformation, error)
 
 type DeadLetterReplayResult struct {
 	Scanned      int
@@ -94,6 +101,7 @@ type DeadLetterReplayResult struct {
 	Retained     int
 	Legacy       int
 	Unroutable   int
+	Skipped      int
 	Destinations map[string]int
 }
 
@@ -136,13 +144,16 @@ func runtimeDeadLetterMetadata(source, deadLetterDestination, routerDestination 
 	}
 }
 
-func transformDeadLetterReplayMessages(ctx context.Context, transform DeadLetterReplayTransformer, messages []DeadLetterMessage) ([][]byte, error) {
-	payloads := make([][]byte, len(messages))
+func transformDeadLetterReplayMessages(ctx context.Context, transform DeadLetterReplayTransformer, messages []DeadLetterMessage) ([]DeadLetterReplayTransformation, error) {
+	transformations := make([]DeadLetterReplayTransformation, len(messages))
+	if len(messages) == 0 {
+		return transformations, nil
+	}
 	if transform == nil {
 		for index := range messages {
-			payloads[index] = append([]byte(nil), messages[index].Payload...)
+			transformations[index].Payload = append([]byte(nil), messages[index].Payload...)
 		}
-		return payloads, nil
+		return transformations, nil
 	}
 	transformed, err := transform(ctx, messages)
 	if err != nil {
@@ -152,9 +163,12 @@ func transformDeadLetterReplayMessages(ctx context.Context, transform DeadLetter
 		return nil, fmt.Errorf("transform dead-letter replay batch returned %d payloads for %d messages", len(transformed), len(messages))
 	}
 	for index := range transformed {
-		payloads[index] = append([]byte(nil), transformed[index]...)
+		transformations[index] = DeadLetterReplayTransformation{
+			Payload: append([]byte(nil), transformed[index].Payload...),
+			Skip:    transformed[index].Skip,
+		}
 	}
-	return payloads, nil
+	return transformations, nil
 }
 
 func encodeDeadLetterForDestination(payload []byte, metadata DeadLetterMetadata, destination string) ([]byte, error) {
@@ -234,6 +248,53 @@ func validateDeadLetterLimit(limit int) error {
 	return nil
 }
 
+func validateDeadLetterReplayRequest(request DeadLetterReplayRequest) error {
+	if request.BatchDelay < 0 {
+		return fmt.Errorf("dead-letter batch delay cannot be negative")
+	}
+	if request.BatchTimeout < 0 {
+		return fmt.Errorf("dead-letter batch timeout cannot be negative")
+	}
+	if request.BatchSize == 0 {
+		return validateDeadLetterLimit(request.Limit)
+	}
+	if request.Limit < 1 || request.Limit > 1000000 {
+		return fmt.Errorf("dead-letter message limit must be between 1 and 1000000 for batched replay")
+	}
+	if request.BatchSize < 1 || request.BatchSize > 10000 {
+		return fmt.Errorf("dead-letter batch size must be between 1 and 10000")
+	}
+	return nil
+}
+
+func deadLetterReplayBatchSize(request DeadLetterReplayRequest) int {
+	if request.BatchSize > 0 {
+		return request.BatchSize
+	}
+	return request.Limit
+}
+
+func waitForDeadLetterReplayBatch(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func deadLetterReplayBatchContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
 func addDeadLetterInspection(result *DeadLetterInspectResult, message DeadLetterMessage, sourceFilter string) {
 	result.Scanned++
 	if message.Legacy {
@@ -310,4 +371,21 @@ func deadLetterSource(message DeadLetterMessage) string {
 		return UnknownSourceQueue
 	}
 	return message.DeadLetter.Source
+}
+
+func skipDeadLetterReplay(result *DeadLetterReplayResult, destination string, execute bool) {
+	result.Skipped++
+	retainPlannedDeadLetterReplay(result, destination, execute)
+}
+
+func retainPlannedDeadLetterReplay(result *DeadLetterReplayResult, destination string, execute bool) {
+	result.Planned--
+	if count := result.Destinations[destination]; count <= 1 {
+		delete(result.Destinations, destination)
+	} else {
+		result.Destinations[destination] = count - 1
+	}
+	if execute {
+		result.Retained++
+	}
 }

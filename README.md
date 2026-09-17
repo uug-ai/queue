@@ -121,11 +121,24 @@ in the envelope, and finally the source queue for envelopes written before
 their configured router, which resolves the next queue from the event's
 remaining stages, while non-pipeline workers preserve source-queue behavior.
 
-`DeadLetterReplayRequest.Transform` can replace payloads for an entire planned
-batch before publication. The callback receives decoded messages in replay
-order and must return the same number of payloads. Providers retain the batch
-when transformation fails and continue to publish each transformed payload
-before settling its original dead-letter message.
+`DeadLetterReplayRequest.Transform` can replace or skip payloads before
+publication. Set `BatchSize`, `BatchTimeout`, and `BatchDelay` to process a
+larger bounded `Limit` in chunks within one provider operation. The callback
+receives decoded messages in replay order and must return one transformation
+for each message. A skipped message remains dead-lettered, while valid messages
+in the same batch continue where the provider can settle them safely. Providers
+retain the current batch when transformation fails and always publish a
+transformed payload before settling its original dead-letter message.
+
+RabbitMQ keeps retained deliveries unacknowledged and SQS keeps them invisible
+until the bounded operation finishes, preventing a retained message from being
+scanned repeatedly across batches. Kafka offsets are contiguous per partition:
+after a skipped message, later messages in that partition remain uncommitted,
+while replay can continue on other partitions. Because retained RabbitMQ
+deliveries and SQS receipt handles are held for the operation, callers should
+treat `Limit` as both a work and memory safety bound. Batched SQS replay requires
+either `BatchTimeout` or an overall context deadline so its visibility window
+can safely cover the run.
 
 ## Inspecting and Replaying Dead-Letter Messages
 

@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
@@ -34,8 +37,14 @@ func (f *fakeSQSClient) GetQueueUrl(_ context.Context, input *awssqs.GetQueueUrl
 	return &awssqs.GetQueueUrlOutput{QueueUrl: aws.String(queueURL)}, nil
 }
 
-func (f *fakeSQSClient) ReceiveMessage(context.Context, *awssqs.ReceiveMessageInput, ...func(*awssqs.Options)) (*awssqs.ReceiveMessageOutput, error) {
-	return &awssqs.ReceiveMessageOutput{Messages: f.receiveMessages}, nil
+func (f *fakeSQSClient) ReceiveMessage(_ context.Context, input *awssqs.ReceiveMessageInput, _ ...func(*awssqs.Options)) (*awssqs.ReceiveMessageOutput, error) {
+	count := int(input.MaxNumberOfMessages)
+	if count > len(f.receiveMessages) {
+		count = len(f.receiveMessages)
+	}
+	messages := append([]types.Message(nil), f.receiveMessages[:count]...)
+	f.receiveMessages = f.receiveMessages[count:]
+	return &awssqs.ReceiveMessageOutput{Messages: messages}, nil
 }
 
 func (f *fakeSQSClient) SendMessage(_ context.Context, input *awssqs.SendMessageInput, _ ...func(*awssqs.Options)) (*awssqs.SendMessageOutput, error) {
@@ -110,11 +119,11 @@ func TestSQSDeadLetterReplaySendsBeforeDelete(t *testing.T) {
 	result, err := client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
 		Limit:   1,
 		Execute: true,
-		Transform: func(_ context.Context, messages []DeadLetterMessage) ([][]byte, error) {
+		Transform: func(_ context.Context, messages []DeadLetterMessage) ([]DeadLetterReplayTransformation, error) {
 			if len(messages) != 1 || string(messages[0].Payload) != "payload" {
 				t.Fatalf("transform messages = %+v", messages)
 			}
-			return [][]byte{[]byte("transformed")}, nil
+			return []DeadLetterReplayTransformation{{Payload: []byte("transformed")}}, nil
 		},
 	})
 	if err != nil {
@@ -146,7 +155,7 @@ func TestSQSDeadLetterReplayTransformFailureReleasesBatch(t *testing.T) {
 	_, err = client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
 		Limit:   1,
 		Execute: true,
-		Transform: func(context.Context, []DeadLetterMessage) ([][]byte, error) {
+		Transform: func(context.Context, []DeadLetterMessage) ([]DeadLetterReplayTransformation, error) {
 			return nil, errors.New("refresh failed")
 		},
 	})
@@ -155,6 +164,121 @@ func TestSQSDeadLetterReplayTransformFailureReleasesBatch(t *testing.T) {
 	}
 	if len(fake.sent) != 0 || len(fake.deleted) != 0 || len(fake.visibilityChanges) != 1 {
 		t.Fatalf("sent=%d deleted=%d visibility=%d", len(fake.sent), len(fake.deleted), len(fake.visibilityChanges))
+	}
+}
+
+func TestSQSDeadLetterReplayBatchesAndRetainsSkippedMessages(t *testing.T) {
+	client, fake := newTestSQS(t, types.Message{})
+	fake.deleteError = nil
+	fake.visibilityError = nil
+	fake.receiveMessages = nil
+	for index, payload := range []string{"one", "poison", "three", "four", "five"} {
+		envelope, err := encodeDeadLetter([]byte(payload), DeadLetterMetadata{
+			Source:      "events",
+			Destination: "deadletter",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fake.receiveMessages = append(fake.receiveMessages, types.Message{
+			MessageId:     aws.String(fmt.Sprintf("message-%d", index)),
+			Body:          aws.String(string(envelope)),
+			ReceiptHandle: aws.String(fmt.Sprintf("receipt-%d", index)),
+		})
+	}
+
+	var batches []int
+	result, err := client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
+		Limit:        5,
+		BatchSize:    2,
+		BatchTimeout: time.Minute,
+		Execute:      true,
+		Transform: func(_ context.Context, messages []DeadLetterMessage) ([]DeadLetterReplayTransformation, error) {
+			batches = append(batches, len(messages))
+			transformed := make([]DeadLetterReplayTransformation, len(messages))
+			for index, message := range messages {
+				if string(message.Payload) == "poison" {
+					transformed[index].Skip = true
+				} else {
+					transformed[index].Payload = append([]byte("fresh-"), message.Payload...)
+				}
+			}
+			return transformed, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ReplayDeadLetters: %v", err)
+	}
+	if !slices.Equal(batches, []int{2, 2, 1}) {
+		t.Fatalf("transform batch sizes = %v", batches)
+	}
+	if len(fake.sent) != 4 || len(fake.deleted) != 4 || len(fake.visibilityChanges) != 1 {
+		t.Fatalf("sent=%d deleted=%d visibility=%d", len(fake.sent), len(fake.deleted), len(fake.visibilityChanges))
+	}
+	if result.Scanned != 5 || result.Matched != 5 || result.Planned != 4 ||
+		result.Replayed != 4 || result.Retained != 1 || result.Skipped != 1 ||
+		result.Destinations["events"] != 4 {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestSQSDeadLetterReplayVisibilityCoversBatchedOperation(t *testing.T) {
+	timeout, err := deadLetterReplayVisibilityTimeout(context.Background(), 30, DeadLetterReplayRequest{
+		Limit:        30000,
+		BatchSize:    100,
+		BatchDelay:   time.Second,
+		BatchTimeout: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if timeout != 18600 {
+		t.Fatalf("visibility timeout = %d, want 18600", timeout)
+	}
+
+	_, err = deadLetterReplayVisibilityTimeout(context.Background(), 30, DeadLetterReplayRequest{
+		Limit:        1000000,
+		BatchSize:    100,
+		BatchTimeout: time.Minute,
+	})
+	if err == nil || !strings.Contains(err.Error(), "12-hour maximum") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestSQSDeadLetterBatchedReplayRequiresBoundedOperation(t *testing.T) {
+	request := DeadLetterReplayRequest{
+		Limit:     30000,
+		BatchSize: 100,
+	}
+	err := validateSQSDeadLetterReplayRequest(context.Background(), request, 20)
+	if err == nil || !strings.Contains(err.Error(), "BatchTimeout or a context deadline") {
+		t.Fatalf("error = %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if err := validateSQSDeadLetterReplayRequest(ctx, request, 20); err != nil {
+		t.Fatal(err)
+	}
+	longCtx, longCancel := context.WithTimeout(context.Background(), 6*time.Hour)
+	defer longCancel()
+	timeout, err := deadLetterReplayVisibilityTimeout(longCtx, 30, DeadLetterReplayRequest{
+		Limit:      100000,
+		BatchSize:  10,
+		BatchDelay: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if timeout < 6*60*60 {
+		t.Fatalf("visibility timeout = %d, want the overall context bound", timeout)
+	}
+
+	request.BatchTimeout = 20 * time.Second
+	err = validateSQSDeadLetterReplayRequest(context.Background(), request, 20)
+	if err == nil || !strings.Contains(err.Error(), "must exceed") {
+		t.Fatalf("error = %v", err)
 	}
 }
 
