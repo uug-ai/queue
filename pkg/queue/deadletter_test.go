@@ -2,6 +2,7 @@ package queue
 
 import (
 	"bytes"
+	"context"
 	"testing"
 	"time"
 )
@@ -162,5 +163,34 @@ func TestRuntimeDeadLetterMetadataFallsBackToSourceWithoutRouter(t *testing.T) {
 	metadata := runtimeDeadLetterMetadata("sequence", "deadletter", "", DeadLetterReasonHandlerError, 2)
 	if metadata.ReplayDestination != "sequence" {
 		t.Fatalf("replay destination = %q, want sequence", metadata.ReplayDestination)
+	}
+}
+
+func TestTransformDeadLetterReplayMessages(t *testing.T) {
+	messages := []DeadLetterMessage{
+		{ID: "one", Payload: []byte("first")},
+		{ID: "two", Payload: []byte("second")},
+	}
+	payloads, err := transformDeadLetterReplayMessages(context.Background(), func(_ context.Context, got []DeadLetterMessage) ([][]byte, error) {
+		if len(got) != 2 || got[0].ID != "one" || got[1].ID != "two" {
+			t.Fatalf("messages = %+v", got)
+		}
+		return [][]byte{[]byte("transformed-first"), []byte("transformed-second")}, nil
+	}, messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(payloads[0], []byte("transformed-first")) ||
+		!bytes.Equal(payloads[1], []byte("transformed-second")) {
+		t.Fatalf("payloads = %q", payloads)
+	}
+}
+
+func TestTransformDeadLetterReplayMessagesRequiresMatchingResultCount(t *testing.T) {
+	_, err := transformDeadLetterReplayMessages(context.Background(), func(context.Context, []DeadLetterMessage) ([][]byte, error) {
+		return nil, nil
+	}, []DeadLetterMessage{{ID: "one"}})
+	if err == nil {
+		t.Fatal("expected transform result count error")
 	}
 }

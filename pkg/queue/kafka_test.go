@@ -161,6 +161,12 @@ func TestKafkaDeadLetterReplayPublishesBeforeCommit(t *testing.T) {
 	result, err := client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
 		Limit:   1,
 		Execute: true,
+		Transform: func(_ context.Context, messages []DeadLetterMessage) ([][]byte, error) {
+			if len(messages) != 1 || string(messages[0].Payload) != "payload" {
+				t.Fatalf("transform messages = %+v", messages)
+			}
+			return [][]byte{[]byte("transformed")}, nil
+		},
 	})
 	if err != nil {
 		t.Fatalf("ReplayDeadLetters: %v", err)
@@ -168,7 +174,7 @@ func TestKafkaDeadLetterReplayPublishesBeforeCommit(t *testing.T) {
 	if result.Replayed != 1 || consumer.commitCount != 1 || len(producer.messages) != 1 {
 		t.Fatalf("result=%+v commits=%d messages=%+v", result, consumer.commitCount, producer.messages)
 	}
-	if *producer.messages[0].TopicPartition.Topic != "events" || string(producer.messages[0].Value) != "payload" {
+	if *producer.messages[0].TopicPartition.Topic != "events" || string(producer.messages[0].Value) != "transformed" {
 		t.Fatalf("replayed message = %+v", producer.messages[0])
 	}
 }

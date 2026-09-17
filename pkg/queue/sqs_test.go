@@ -109,6 +109,12 @@ func TestSQSDeadLetterReplaySendsBeforeDelete(t *testing.T) {
 	result, err := client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
 		Limit:   1,
 		Execute: true,
+		Transform: func(_ context.Context, messages []DeadLetterMessage) ([][]byte, error) {
+			if len(messages) != 1 || string(messages[0].Payload) != "payload" {
+				t.Fatalf("transform messages = %+v", messages)
+			}
+			return [][]byte{[]byte("transformed")}, nil
+		},
 	})
 	if err != nil {
 		t.Fatalf("ReplayDeadLetters: %v", err)
@@ -116,7 +122,7 @@ func TestSQSDeadLetterReplaySendsBeforeDelete(t *testing.T) {
 	if result.Replayed != 1 || len(fake.operations) != 2 || fake.operations[0] != "send" || fake.operations[1] != "delete" {
 		t.Fatalf("result=%+v operations=%v", result, fake.operations)
 	}
-	if aws.ToString(fake.sent[0].QueueUrl) != fake.queueURLs["events"] || aws.ToString(fake.sent[0].MessageBody) != "payload" {
+	if aws.ToString(fake.sent[0].QueueUrl) != fake.queueURLs["events"] || aws.ToString(fake.sent[0].MessageBody) != "transformed" {
 		t.Fatalf("replay send = %+v", fake.sent[0])
 	}
 }

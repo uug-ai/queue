@@ -82,6 +82,12 @@ func (k *Kafka) ReplayDeadLetters(ctx context.Context, request DeadLetterReplayR
 		idleTimeout = 2 * time.Second
 	}
 	assigned := false
+	type replayItem struct {
+		sourceMessage *kafka.Message
+		message       DeadLetterMessage
+		plan          deadLetterReplayPlan
+	}
+	items := make([]replayItem, 0, request.Limit)
 	for result.Scanned < request.Limit {
 		message, done, err := readKafkaDeadLetter(ctx, consumer, idleTimeout, &assigned)
 		if err != nil {
@@ -98,7 +104,7 @@ func (k *Kafka) ReplayDeadLetters(ctx context.Context, request DeadLetterReplayR
 		if err != nil {
 			return result, err
 		}
-		if plan.destination == "" || !request.Execute {
+		if plan.destination == "" {
 			if request.Execute && plan.matched {
 				// Kafka commits are contiguous per partition. Do not process a
 				// later message after retaining this one, because committing the
@@ -107,20 +113,38 @@ func (k *Kafka) ReplayDeadLetters(ctx context.Context, request DeadLetterReplayR
 			}
 			continue
 		}
+		items = append(items, replayItem{sourceMessage: message, message: decoded, plan: plan})
+	}
+
+	decodedMessages := make([]DeadLetterMessage, len(items))
+	for index := range items {
+		decodedMessages[index] = items[index].message
+	}
+	payloads, err := transformDeadLetterReplayMessages(ctx, request.Transform, decodedMessages)
+	if err != nil {
+		return result, err
+	}
+	if request.Execute && len(items) > 0 {
 		if !k.options.DisableAutoTopicCreation {
 			return result, fmt.Errorf("Kafka replay requires automatic topic creation to be disabled")
 		}
 		_, producer := k.clients()
-		if err := ensureKafkaTopicExists(producer, plan.destination, k.deliveryTimeout()); err != nil {
-			return result, fmt.Errorf("validate Kafka replay destination for message %q: %w", decoded.ID, err)
+		validatedDestinations := make(map[string]struct{})
+		for index, item := range items {
+			if _, exists := validatedDestinations[item.plan.destination]; !exists {
+				if err := ensureKafkaTopicExists(producer, item.plan.destination, k.deliveryTimeout()); err != nil {
+					return result, fmt.Errorf("validate Kafka replay destination for message %q: %w", item.message.ID, err)
+				}
+				validatedDestinations[item.plan.destination] = struct{}{}
+			}
+			if err := k.publishContext(ctx, producer, item.plan.destination, payloads[index], nil); err != nil {
+				return result, fmt.Errorf("replay Kafka dead-letter message %q: %w", item.message.ID, err)
+			}
+			if _, err := consumer.CommitMessage(item.sourceMessage); err != nil {
+				return result, fmt.Errorf("commit replayed Kafka dead-letter message %q: %w", item.message.ID, err)
+			}
+			result.Replayed++
 		}
-		if err := k.publishContext(ctx, producer, plan.destination, decoded.Payload, nil); err != nil {
-			return result, fmt.Errorf("replay Kafka dead-letter message %q: %w", decoded.ID, err)
-		}
-		if _, err := consumer.CommitMessage(message); err != nil {
-			return result, fmt.Errorf("commit replayed Kafka dead-letter message %q: %w", decoded.ID, err)
-		}
-		result.Replayed++
 	}
 	return result, nil
 }

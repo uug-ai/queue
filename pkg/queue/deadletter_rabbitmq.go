@@ -118,6 +118,12 @@ func (r *RabbitMQ) ReplayDeadLetters(ctx context.Context, request DeadLetterRepl
 	requeueRetained := func(operationErr error) error {
 		return errors.Join(operationErr, r.restoreRabbitDeadLetters(retained))
 	}
+	type replayItem struct {
+		delivery amqp.Delivery
+		message  DeadLetterMessage
+		plan     deadLetterReplayPlan
+	}
+	items := make([]replayItem, 0, request.Limit)
 	for result.Scanned < request.Limit {
 		if err := ctx.Err(); err != nil {
 			return result, requeueRetained(err)
@@ -138,22 +144,45 @@ func (r *RabbitMQ) ReplayDeadLetters(ctx context.Context, request DeadLetterRepl
 		if err != nil {
 			return result, requeueRetained(err)
 		}
-		if plan.destination == "" || !request.Execute {
+		if plan.destination == "" {
 			continue
 		}
-		if err := r.publishDeadLetterConfirmed(ctx, plan.destination, decoded.Payload); err != nil {
-			return result, requeueRetained(fmt.Errorf("replay RabbitMQ dead-letter message %q: %w", decoded.ID, err))
+		items = append(items, replayItem{delivery: delivery, message: decoded, plan: plan})
+	}
+
+	messages := make([]DeadLetterMessage, len(items))
+	for index := range items {
+		messages[index] = items[index].message
+	}
+	payloads, err := transformDeadLetterReplayMessages(ctx, request.Transform, messages)
+	if err != nil {
+		return result, requeueRetained(err)
+	}
+	if request.Execute {
+		for index, item := range items {
+			if err := r.publishDeadLetterConfirmed(ctx, item.plan.destination, payloads[index]); err != nil {
+				return result, requeueRetained(fmt.Errorf("replay RabbitMQ dead-letter message %q: %w", item.message.ID, err))
+			}
+			if err := item.delivery.Ack(false); err != nil {
+				return result, requeueRetained(fmt.Errorf("settle replayed RabbitMQ dead-letter message %q: %w", item.message.ID, err))
+			}
+			retained = removeRabbitDeadLetter(retained, item.delivery.DeliveryTag)
+			result.Replayed++
 		}
-		if err := delivery.Ack(false); err != nil {
-			return result, requeueRetained(fmt.Errorf("settle replayed RabbitMQ dead-letter message %q: %w", decoded.ID, err))
-		}
-		retained = retained[:len(retained)-1]
-		result.Replayed++
 	}
 	if err := r.restoreRabbitDeadLetters(retained); err != nil {
 		return result, err
 	}
 	return result, nil
+}
+
+func removeRabbitDeadLetter(deliveries []amqp.Delivery, deliveryTag uint64) []amqp.Delivery {
+	for index := range deliveries {
+		if deliveries[index].DeliveryTag == deliveryTag {
+			return append(deliveries[:index], deliveries[index+1:]...)
+		}
+	}
+	return deliveries
 }
 
 func (r *RabbitMQ) getDeadLetter() (amqp.Delivery, bool, error) {

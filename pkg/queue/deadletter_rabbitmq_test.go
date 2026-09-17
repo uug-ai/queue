@@ -65,7 +65,7 @@ func TestRabbitDeadLetterReplayPublishesBeforeAck(t *testing.T) {
 	}
 	published := false
 	client.deadLetterReplayPublish = func(_ context.Context, destination string, payload []byte) error {
-		if destination != "events" || !bytes.Equal(payload, []byte("payload")) {
+		if destination != "events" || !bytes.Equal(payload, []byte("transformed")) {
 			t.Fatalf("publish destination=%q payload=%q", destination, payload)
 		}
 		if len(acknowledger.acked) != 0 {
@@ -78,6 +78,12 @@ func TestRabbitDeadLetterReplayPublishesBeforeAck(t *testing.T) {
 	result, err := client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
 		Limit:   1,
 		Execute: true,
+		Transform: func(_ context.Context, messages []DeadLetterMessage) ([][]byte, error) {
+			if len(messages) != 1 || string(messages[0].Payload) != "payload" {
+				t.Fatalf("transform messages = %+v", messages)
+			}
+			return [][]byte{[]byte("transformed")}, nil
+		},
 	})
 	if err != nil {
 		t.Fatalf("ReplayDeadLetters: %v", err)

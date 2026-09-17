@@ -78,6 +78,13 @@ func (s *SQS) ReplayDeadLetters(ctx context.Context, request DeadLetterReplayReq
 	releaseRetained := func(operationErr error) error {
 		return errors.Join(operationErr, s.releaseSQSDeadLetters(deadLetterQueueURL, retained))
 	}
+	type replayItem struct {
+		sourceMessage  types.Message
+		message        DeadLetterMessage
+		plan           deadLetterReplayPlan
+		destinationURL string
+	}
+	items := make([]replayItem, 0, request.Limit)
 	for result.Scanned < request.Limit {
 		messages, receiveErr := s.receiveDeadLetterBatch(ctx, deadLetterQueueURL, request.Limit-result.Scanned)
 		if receiveErr != nil {
@@ -97,24 +104,41 @@ func (s *SQS) ReplayDeadLetters(ctx context.Context, request DeadLetterReplayReq
 			if planErr != nil {
 				return result, releaseRetained(planErr)
 			}
-			if plan.destination == "" || !request.Execute {
+			if plan.destination == "" {
 				continue
 			}
-			destinationURL, resolveErr := s.queueURL(ctx, plan.destination)
-			if resolveErr != nil {
-				return result, releaseRetained(resolveErr)
+			item := replayItem{sourceMessage: message, message: decoded, plan: plan}
+			if request.Execute {
+				destinationURL, resolveErr := s.queueURL(ctx, plan.destination)
+				if resolveErr != nil {
+					return result, releaseRetained(resolveErr)
+				}
+				if destinationURL == deadLetterQueueURL {
+					return result, releaseRetained(fmt.Errorf("refusing to replay SQS dead-letter message %q back to %q", decoded.ID, s.options.DeadletterQueue))
+				}
+				item.destinationURL = destinationURL
 			}
-			if destinationURL == deadLetterQueueURL {
-				return result, releaseRetained(fmt.Errorf("refusing to replay SQS dead-letter message %q back to %q", decoded.ID, s.options.DeadletterQueue))
-			}
-			if err := s.publishReplay(ctx, plan.destination, destinationURL, decoded.Payload); err != nil {
-				return result, releaseRetained(fmt.Errorf("replay SQS dead-letter message %q: %w", decoded.ID, err))
-			}
+			items = append(items, item)
+		}
+	}
 
-			if err := s.deleteSQSDeadLetter(ctx, deadLetterQueueURL, message); err != nil {
-				return result, releaseRetained(fmt.Errorf("settle replayed SQS dead-letter message %q: %w", decoded.ID, err))
+	decodedMessages := make([]DeadLetterMessage, len(items))
+	for index := range items {
+		decodedMessages[index] = items[index].message
+	}
+	payloads, err := transformDeadLetterReplayMessages(ctx, request.Transform, decodedMessages)
+	if err != nil {
+		return result, releaseRetained(err)
+	}
+	if request.Execute {
+		for index, item := range items {
+			if err := s.publishReplay(ctx, item.plan.destination, item.destinationURL, payloads[index]); err != nil {
+				return result, releaseRetained(fmt.Errorf("replay SQS dead-letter message %q: %w", item.message.ID, err))
 			}
-			retained = removeSQSDeadLetter(retained, aws.ToString(message.ReceiptHandle))
+			if err := s.deleteSQSDeadLetter(ctx, deadLetterQueueURL, item.sourceMessage); err != nil {
+				return result, releaseRetained(fmt.Errorf("settle replayed SQS dead-letter message %q: %w", item.message.ID, err))
+			}
+			retained = removeSQSDeadLetter(retained, aws.ToString(item.sourceMessage.ReceiptHandle))
 			result.Replayed++
 		}
 	}

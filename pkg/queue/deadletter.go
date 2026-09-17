@@ -77,7 +77,14 @@ type DeadLetterReplayRequest struct {
 	Destination string
 	Execute     bool
 	IdleTimeout time.Duration
+	Transform   DeadLetterReplayTransformer
 }
+
+// DeadLetterReplayTransformer replaces payloads for a planned replay batch.
+// Implementations must return one payload for each input message, in the same
+// order. Queue providers still choose the trusted replay destination from the
+// envelope or request and settle messages only after publishing succeeds.
+type DeadLetterReplayTransformer func(context.Context, []DeadLetterMessage) ([][]byte, error)
 
 type DeadLetterReplayResult struct {
 	Scanned      int
@@ -127,6 +134,27 @@ func runtimeDeadLetterMetadata(source, deadLetterDestination, routerDestination 
 		Reason:            reason,
 		Attempts:          attempts,
 	}
+}
+
+func transformDeadLetterReplayMessages(ctx context.Context, transform DeadLetterReplayTransformer, messages []DeadLetterMessage) ([][]byte, error) {
+	payloads := make([][]byte, len(messages))
+	if transform == nil {
+		for index := range messages {
+			payloads[index] = append([]byte(nil), messages[index].Payload...)
+		}
+		return payloads, nil
+	}
+	transformed, err := transform(ctx, messages)
+	if err != nil {
+		return nil, fmt.Errorf("transform dead-letter replay batch: %w", err)
+	}
+	if len(transformed) != len(messages) {
+		return nil, fmt.Errorf("transform dead-letter replay batch returned %d payloads for %d messages", len(transformed), len(messages))
+	}
+	for index := range transformed {
+		payloads[index] = append([]byte(nil), transformed[index]...)
+	}
+	return payloads, nil
 }
 
 func encodeDeadLetterForDestination(payload []byte, metadata DeadLetterMetadata, destination string) ([]byte, error) {
