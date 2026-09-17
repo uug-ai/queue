@@ -29,6 +29,36 @@ type assignmentThenMessageKafkaConsumer struct {
 	readCount int
 }
 
+type queuedKafkaConsumer struct {
+	messages []*kafka.Message
+	index    int
+	commits  []*kafka.Message
+}
+
+func (*queuedKafkaConsumer) SubscribeTopics([]string, kafka.RebalanceCb) error {
+	return nil
+}
+
+func (f *queuedKafkaConsumer) ReadMessage(time.Duration) (*kafka.Message, error) {
+	if f.index >= len(f.messages) {
+		return nil, kafka.NewError(kafka.ErrTimedOut, "timed out", false)
+	}
+	message := f.messages[f.index]
+	f.index++
+	return message, nil
+}
+
+func (f *queuedKafkaConsumer) CommitMessage(message *kafka.Message) ([]kafka.TopicPartition, error) {
+	f.commits = append(f.commits, message)
+	return nil, nil
+}
+
+func (*queuedKafkaConsumer) Assignment() ([]kafka.TopicPartition, error) {
+	return []kafka.TopicPartition{{Partition: 0}, {Partition: 1}}, nil
+}
+
+func (*queuedKafkaConsumer) Close() error { return nil }
+
 func (*assignmentThenMessageKafkaConsumer) SubscribeTopics([]string, kafka.RebalanceCb) error {
 	return nil
 }
@@ -121,6 +151,23 @@ func newTestKafka(t *testing.T, message *kafka.Message) (*Kafka, *fakeKafkaConsu
 	return client, consumer, producer
 }
 
+func TestKafkaDeadLetterEnvelopeRecordsRouter(t *testing.T) {
+	client, _, producer := newTestKafka(t, nil)
+	if err := client.addToDeadletter([]byte("payload"), DeadLetterReasonHandlerError, 0); err != nil {
+		t.Fatal(err)
+	}
+	if len(producer.messages) != 1 {
+		t.Fatalf("published messages = %d, want 1", len(producer.messages))
+	}
+	message, err := decodeDeadLetter("message-1", producer.messages[0].Value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.DeadLetter.Source != "events" || message.DeadLetter.ReplayDestination != "router" {
+		t.Fatalf("dead-letter metadata = %+v", message.DeadLetter)
+	}
+}
+
 func TestKafkaDeadLetterReplayPublishesBeforeCommit(t *testing.T) {
 	envelope, err := encodeDeadLetter([]byte("payload"), DeadLetterMetadata{
 		Source:      "events",
@@ -144,6 +191,12 @@ func TestKafkaDeadLetterReplayPublishesBeforeCommit(t *testing.T) {
 	result, err := client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
 		Limit:   1,
 		Execute: true,
+		Transform: func(_ context.Context, messages []DeadLetterMessage) ([]DeadLetterReplayTransformation, error) {
+			if len(messages) != 1 || string(messages[0].Payload) != "payload" {
+				t.Fatalf("transform messages = %+v", messages)
+			}
+			return []DeadLetterReplayTransformation{{Payload: []byte("transformed")}}, nil
+		},
 	})
 	if err != nil {
 		t.Fatalf("ReplayDeadLetters: %v", err)
@@ -151,8 +204,106 @@ func TestKafkaDeadLetterReplayPublishesBeforeCommit(t *testing.T) {
 	if result.Replayed != 1 || consumer.commitCount != 1 || len(producer.messages) != 1 {
 		t.Fatalf("result=%+v commits=%d messages=%+v", result, consumer.commitCount, producer.messages)
 	}
-	if *producer.messages[0].TopicPartition.Topic != "events" || string(producer.messages[0].Value) != "payload" {
+	if *producer.messages[0].TopicPartition.Topic != "events" || string(producer.messages[0].Value) != "transformed" {
 		t.Fatalf("replayed message = %+v", producer.messages[0])
+	}
+}
+
+func TestKafkaDeadLetterReplayTransformFailureDoesNotPublishOrCommit(t *testing.T) {
+	envelope, err := encodeDeadLetter([]byte("payload"), DeadLetterMetadata{
+		Source:      "events",
+		Destination: "deadletter",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, consumer, producer := newTestKafka(t, &kafka.Message{
+		TopicPartition: kafka.TopicPartition{
+			Topic:     stringPointer("deadletter"),
+			Partition: 1,
+			Offset:    42,
+		},
+		Value: envelope,
+	})
+	client.options.DisableAutoTopicCreation = true
+
+	_, err = client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
+		Limit:   1,
+		Execute: true,
+		Transform: func(context.Context, []DeadLetterMessage) ([]DeadLetterReplayTransformation, error) {
+			return nil, errors.New("refresh failed")
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "refresh failed") {
+		t.Fatalf("error = %v", err)
+	}
+	if len(producer.messages) != 0 || consumer.commitCount != 0 {
+		t.Fatalf("messages=%d commits=%d", len(producer.messages), consumer.commitCount)
+	}
+}
+
+func TestKafkaDeadLetterReplayBlocksOnlySkippedPartition(t *testing.T) {
+	var messages []*kafka.Message
+	for index, item := range []struct {
+		partition int32
+		payload   string
+	}{
+		{partition: 0, payload: "one"},
+		{partition: 0, payload: "poison"},
+		{partition: 0, payload: "blocked"},
+		{partition: 1, payload: "other-partition"},
+	} {
+		envelope, err := encodeDeadLetter([]byte(item.payload), DeadLetterMetadata{
+			Source:      "events",
+			Destination: "deadletter",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		messages = append(messages, &kafka.Message{
+			TopicPartition: kafka.TopicPartition{
+				Topic:     stringPointer("deadletter"),
+				Partition: item.partition,
+				Offset:    kafka.Offset(index),
+			},
+			Value: envelope,
+		})
+	}
+	client, _, producer := newTestKafka(t, nil)
+	consumer := &queuedKafkaConsumer{messages: messages}
+	client.Consumer = consumer
+	client.options.DisableAutoTopicCreation = true
+
+	result, err := client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
+		Limit:     4,
+		BatchSize: 4,
+		Execute:   true,
+		Transform: func(_ context.Context, messages []DeadLetterMessage) ([]DeadLetterReplayTransformation, error) {
+			transformed := make([]DeadLetterReplayTransformation, len(messages))
+			for index, message := range messages {
+				if string(message.Payload) == "poison" {
+					transformed[index].Skip = true
+				} else {
+					transformed[index].Payload = append([]byte("fresh-"), message.Payload...)
+				}
+			}
+			return transformed, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ReplayDeadLetters: %v", err)
+	}
+	if len(producer.messages) != 2 || string(producer.messages[0].Value) != "fresh-one" ||
+		string(producer.messages[1].Value) != "fresh-other-partition" {
+		t.Fatalf("published messages = %+v", producer.messages)
+	}
+	if len(consumer.commits) != 2 || consumer.commits[0] != messages[0] || consumer.commits[1] != messages[3] {
+		t.Fatalf("commits = %+v", consumer.commits)
+	}
+	if result.Scanned != 4 || result.Matched != 4 || result.Planned != 2 ||
+		result.Replayed != 2 || result.Retained != 2 || result.Skipped != 1 ||
+		result.Destinations["events"] != 2 {
+		t.Fatalf("result = %+v", result)
 	}
 }
 

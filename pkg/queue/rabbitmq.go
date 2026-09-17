@@ -1364,12 +1364,13 @@ func (r *RabbitMQ) addToDeadletter(payload []byte, reason DeadLetterReason, atte
 }
 
 func (r *RabbitMQ) deadLetterEnvelope(payload []byte, reason DeadLetterReason, attempts int) ([]byte, error) {
-	return encodeDeadLetter(payload, DeadLetterMetadata{
-		Source:      r.options.ConsumerQueue,
-		Destination: r.options.DeadletterQueue,
-		Reason:      reason,
-		Attempts:    attempts,
-	})
+	return encodeDeadLetter(payload, runtimeDeadLetterMetadata(
+		r.options.ConsumerQueue,
+		r.options.DeadletterQueue,
+		r.options.RouterQueue,
+		reason,
+		attempts,
+	))
 }
 
 func (r *RabbitMQ) addToDeadletterConfirmed(payload []byte, reason DeadLetterReason) error {

@@ -25,13 +25,14 @@ const (
 
 // DeadLetterMetadata describes where and why a message was parked.
 type DeadLetterMetadata struct {
-	Source      string            `json:"source,omitempty"`
-	Destination string            `json:"destination"`
-	Service     string            `json:"service,omitempty"`
-	Reason      DeadLetterReason  `json:"reason"`
-	Attempts    int               `json:"attempts,omitempty"`
-	Timestamp   time.Time         `json:"timestamp"`
-	Attributes  map[string]string `json:"attributes,omitempty"`
+	Source            string            `json:"source,omitempty"`
+	Destination       string            `json:"destination"`
+	ReplayDestination string            `json:"replayDestination,omitempty"`
+	Service           string            `json:"service,omitempty"`
+	Reason            DeadLetterReason  `json:"reason"`
+	Attempts          int               `json:"attempts,omitempty"`
+	Timestamp         time.Time         `json:"timestamp"`
+	Attributes        map[string]string `json:"attributes,omitempty"`
 }
 
 // DeadLetterEnvelope is the provider-independent format stored on dead-letter
@@ -71,21 +72,37 @@ type DeadLetterInspectResult struct {
 }
 
 type DeadLetterReplayRequest struct {
-	Limit       int
-	Source      string
-	Destination string
-	Execute     bool
-	IdleTimeout time.Duration
+	Limit        int
+	BatchSize    int
+	BatchDelay   time.Duration
+	BatchTimeout time.Duration
+	Source       string
+	Destination  string
+	Execute      bool
+	IdleTimeout  time.Duration
+	Transform    DeadLetterReplayTransformer
 }
 
+type DeadLetterReplayTransformation struct {
+	Payload []byte
+	Skip    bool
+}
+
+// DeadLetterReplayTransformer replaces or skips payloads for a planned replay
+// batch. Implementations must return one result for each input message, in the
+// same order. A skipped message remains on the dead-letter destination.
+type DeadLetterReplayTransformer func(context.Context, []DeadLetterMessage) ([]DeadLetterReplayTransformation, error)
+
 type DeadLetterReplayResult struct {
-	Scanned    int
-	Matched    int
-	Planned    int
-	Replayed   int
-	Retained   int
-	Legacy     int
-	Unroutable int
+	Scanned      int
+	Matched      int
+	Planned      int
+	Replayed     int
+	Retained     int
+	Legacy       int
+	Unroutable   int
+	Skipped      int
+	Destinations map[string]int
 }
 
 // DeadLetterAdmin is intentionally separate from QueueInterface: applications
@@ -111,6 +128,47 @@ func encodeDeadLetter(payload []byte, metadata DeadLetterMetadata) ([]byte, erro
 		Payload:    append([]byte(nil), payload...),
 		DeadLetter: metadata,
 	})
+}
+
+func runtimeDeadLetterMetadata(source, deadLetterDestination, routerDestination string, reason DeadLetterReason, attempts int) DeadLetterMetadata {
+	replayDestination := strings.TrimSpace(routerDestination)
+	if replayDestination == "" {
+		replayDestination = strings.TrimSpace(source)
+	}
+	return DeadLetterMetadata{
+		Source:            source,
+		Destination:       deadLetterDestination,
+		ReplayDestination: replayDestination,
+		Reason:            reason,
+		Attempts:          attempts,
+	}
+}
+
+func transformDeadLetterReplayMessages(ctx context.Context, transform DeadLetterReplayTransformer, messages []DeadLetterMessage) ([]DeadLetterReplayTransformation, error) {
+	transformations := make([]DeadLetterReplayTransformation, len(messages))
+	if len(messages) == 0 {
+		return transformations, nil
+	}
+	if transform == nil {
+		for index := range messages {
+			transformations[index].Payload = append([]byte(nil), messages[index].Payload...)
+		}
+		return transformations, nil
+	}
+	transformed, err := transform(ctx, messages)
+	if err != nil {
+		return nil, fmt.Errorf("transform dead-letter replay batch: %w", err)
+	}
+	if len(transformed) != len(messages) {
+		return nil, fmt.Errorf("transform dead-letter replay batch returned %d payloads for %d messages", len(transformed), len(messages))
+	}
+	for index := range transformed {
+		transformations[index] = DeadLetterReplayTransformation{
+			Payload: append([]byte(nil), transformed[index].Payload...),
+			Skip:    transformed[index].Skip,
+		}
+	}
+	return transformations, nil
 }
 
 func encodeDeadLetterForDestination(payload []byte, metadata DeadLetterMetadata, destination string) ([]byte, error) {
@@ -190,6 +248,53 @@ func validateDeadLetterLimit(limit int) error {
 	return nil
 }
 
+func validateDeadLetterReplayRequest(request DeadLetterReplayRequest) error {
+	if request.BatchDelay < 0 {
+		return fmt.Errorf("dead-letter batch delay cannot be negative")
+	}
+	if request.BatchTimeout < 0 {
+		return fmt.Errorf("dead-letter batch timeout cannot be negative")
+	}
+	if request.BatchSize == 0 {
+		return validateDeadLetterLimit(request.Limit)
+	}
+	if request.Limit < 1 || request.Limit > 1000000 {
+		return fmt.Errorf("dead-letter message limit must be between 1 and 1000000 for batched replay")
+	}
+	if request.BatchSize < 1 || request.BatchSize > 10000 {
+		return fmt.Errorf("dead-letter batch size must be between 1 and 10000")
+	}
+	return nil
+}
+
+func deadLetterReplayBatchSize(request DeadLetterReplayRequest) int {
+	if request.BatchSize > 0 {
+		return request.BatchSize
+	}
+	return request.Limit
+}
+
+func waitForDeadLetterReplayBatch(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func deadLetterReplayBatchContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
 func addDeadLetterInspection(result *DeadLetterInspectResult, message DeadLetterMessage, sourceFilter string) {
 	result.Scanned++
 	if message.Legacy {
@@ -237,7 +342,10 @@ func planDeadLetterReplay(result *DeadLetterReplayResult, message DeadLetterMess
 	result.Matched++
 	destination := strings.TrimSpace(request.Destination)
 	if destination == "" && !message.Legacy {
-		destination = strings.TrimSpace(message.DeadLetter.Source)
+		destination = strings.TrimSpace(message.DeadLetter.ReplayDestination)
+		if destination == "" {
+			destination = strings.TrimSpace(message.DeadLetter.Source)
+		}
 	}
 	if destination == "" {
 		result.Unroutable++
@@ -248,6 +356,10 @@ func planDeadLetterReplay(result *DeadLetterReplayResult, message DeadLetterMess
 		return deadLetterReplayPlan{}, fmt.Errorf("refusing to replay dead-letter message %q back to %q", message.ID, deadLetterDestination)
 	}
 	result.Planned++
+	if result.Destinations == nil {
+		result.Destinations = make(map[string]int)
+	}
+	result.Destinations[destination]++
 	if !request.Execute {
 		result.Retained++
 	}
@@ -259,4 +371,21 @@ func deadLetterSource(message DeadLetterMessage) string {
 		return UnknownSourceQueue
 	}
 	return message.DeadLetter.Source
+}
+
+func skipDeadLetterReplay(result *DeadLetterReplayResult, destination string, execute bool) {
+	result.Skipped++
+	retainPlannedDeadLetterReplay(result, destination, execute)
+}
+
+func retainPlannedDeadLetterReplay(result *DeadLetterReplayResult, destination string, execute bool) {
+	result.Planned--
+	if count := result.Destinations[destination]; count <= 1 {
+		delete(result.Destinations, destination)
+	} else {
+		result.Destinations[destination] = count - 1
+	}
+	if execute {
+		result.Retained++
+	}
 }

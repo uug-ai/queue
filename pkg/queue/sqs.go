@@ -458,12 +458,13 @@ func (s *SQS) addToDeadletter(payload []byte, reason DeadLetterReason, attempts 
 }
 
 func (s *SQS) deadLetterEnvelope(payload []byte, reason DeadLetterReason, attempts int) ([]byte, error) {
-	return encodeDeadLetter(payload, DeadLetterMetadata{
-		Source:      s.options.ConsumerQueue,
-		Destination: s.options.DeadletterQueue,
-		Reason:      reason,
-		Attempts:    attempts,
-	})
+	return encodeDeadLetter(payload, runtimeDeadLetterMetadata(
+		s.options.ConsumerQueue,
+		s.options.DeadletterQueue,
+		s.options.RouterQueue,
+		reason,
+		attempts,
+	))
 }
 
 func (s *SQS) SetDisasterRecoveryHandler(handler DisasterRecoveryHandler) {

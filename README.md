@@ -72,6 +72,11 @@ Dead-letter inspection and replay are deliberately exposed through the separate
 administrative methods, while operational tooling can use one contract across
 all supported brokers.
 
+RabbitMQ services that need to deliberately park raw deliveries for operational
+testing can enable confirmed delivery and call `ReadMessagesToDeadletter`. The
+method preserves the original body and acknowledges it only after the broker
+confirms the dead-letter envelope.
+
 ### Pipeline Actions
 
 Message handlers return a `models.PipelineAction`. The queue client maps that
@@ -94,6 +99,8 @@ writes should therefore be idempotent.
 - The exact original payload, encoded safely even when it is not valid JSON
 - The source queue or topic
 - The dead-letter destination
+- The replay destination: the configured pipeline router, or the source when no
+  router is configured
 - The failure reason, attempt count, and UTC timestamp
 - Optional service and provider-neutral attributes
 
@@ -107,6 +114,31 @@ set source metadata use `DeadLetterAdmin.PublishDeadLetter`.
 Existing raw dead-letter messages remain readable. They are reported with the
 source `unknown` and require an explicit replay destination because the library
 cannot safely infer where they came from.
+
+Replay prefers an operator-supplied destination, then the destination recorded
+in the envelope, and finally the source queue for envelopes written before
+`replayDestination` was introduced. Pipeline workers therefore replay through
+their configured router, which resolves the next queue from the event's
+remaining stages, while non-pipeline workers preserve source-queue behavior.
+
+`DeadLetterReplayRequest.Transform` can replace or skip payloads before
+publication. Set `BatchSize`, `BatchTimeout`, and `BatchDelay` to process a
+larger bounded `Limit` in chunks within one provider operation. The callback
+receives decoded messages in replay order and must return one transformation
+for each message. A skipped message remains dead-lettered, while valid messages
+in the same batch continue where the provider can settle them safely. Providers
+retain the current batch when transformation fails and always publish a
+transformed payload before settling its original dead-letter message.
+
+RabbitMQ keeps retained deliveries unacknowledged and SQS keeps them invisible
+until the bounded operation finishes, preventing a retained message from being
+scanned repeatedly across batches. Kafka offsets are contiguous per partition:
+after a skipped message, later messages in that partition remain uncommitted,
+while replay can continue on other partitions. Because retained RabbitMQ
+deliveries and SQS receipt handles are held for the operation, callers should
+treat `Limit` as both a work and memory safety bound. Batched SQS replay requires
+either `BatchTimeout` or an overall context deadline so its visibility window
+can safely cover the run.
 
 ## Inspecting and Replaying Dead-Letter Messages
 

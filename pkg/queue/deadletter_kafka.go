@@ -63,7 +63,7 @@ func (k *Kafka) InspectDeadLetters(ctx context.Context, request DeadLetterInspec
 
 func (k *Kafka) ReplayDeadLetters(ctx context.Context, request DeadLetterReplayRequest) (DeadLetterReplayResult, error) {
 	var result DeadLetterReplayResult
-	if err := validateDeadLetterLimit(request.Limit); err != nil {
+	if err := validateDeadLetterReplayRequest(request); err != nil {
 		return result, err
 	}
 	if request.Execute && request.Source != "" {
@@ -82,45 +82,111 @@ func (k *Kafka) ReplayDeadLetters(ctx context.Context, request DeadLetterReplayR
 		idleTimeout = 2 * time.Second
 	}
 	assigned := false
+	type replayItem struct {
+		sourceMessage *kafka.Message
+		message       DeadLetterMessage
+		plan          deadLetterReplayPlan
+	}
+	batchSize := deadLetterReplayBatchSize(request)
+	blockedPartitions := make(map[int32]struct{})
+	validatedDestinations := make(map[string]struct{})
 	for result.Scanned < request.Limit {
-		message, done, err := readKafkaDeadLetter(ctx, consumer, idleTimeout, &assigned)
-		if err != nil {
-			return result, err
-		}
-		if done {
-			break
-		}
-		decoded, err := decodeDeadLetter(kafkaDeadLetterID(message), message.Value)
-		if err != nil {
-			return result, err
-		}
-		plan, err := planDeadLetterReplay(&result, decoded, request, k.options.DeadletterTopic)
-		if err != nil {
-			return result, err
-		}
-		if plan.destination == "" || !request.Execute {
-			if request.Execute && plan.matched {
-				// Kafka commits are contiguous per partition. Do not process a
-				// later message after retaining this one, because committing the
-				// later offset could make the retained message unreplayable.
+		batchCtx, cancelBatch := deadLetterReplayBatchContext(ctx, request.BatchTimeout)
+		items := make([]replayItem, 0, batchSize)
+		batchScanned := 0
+		exhausted := false
+		for batchScanned < batchSize && result.Scanned < request.Limit {
+			message, done, err := readKafkaDeadLetter(batchCtx, consumer, idleTimeout, &assigned)
+			if err != nil {
+				cancelBatch()
+				return result, err
+			}
+			if done {
+				exhausted = true
 				break
 			}
-			continue
+			batchScanned++
+			decoded, err := decodeDeadLetter(kafkaDeadLetterID(message), message.Value)
+			if err != nil {
+				cancelBatch()
+				return result, err
+			}
+			plan, err := planDeadLetterReplay(&result, decoded, request, k.options.DeadletterTopic)
+			if err != nil {
+				cancelBatch()
+				return result, err
+			}
+			if plan.destination == "" {
+				if request.Execute && plan.matched {
+					blockedPartitions[message.TopicPartition.Partition] = struct{}{}
+				}
+				continue
+			}
+			if request.Execute {
+				if _, blocked := blockedPartitions[message.TopicPartition.Partition]; blocked {
+					retainPlannedDeadLetterReplay(&result, plan.destination, true)
+					continue
+				}
+			}
+			items = append(items, replayItem{sourceMessage: message, message: decoded, plan: plan})
 		}
-		if !k.options.DisableAutoTopicCreation {
+
+		decodedMessages := make([]DeadLetterMessage, len(items))
+		for index := range items {
+			decodedMessages[index] = items[index].message
+		}
+		transformations, err := transformDeadLetterReplayMessages(batchCtx, request.Transform, decodedMessages)
+		if err != nil {
+			cancelBatch()
+			return result, err
+		}
+		if request.Execute && len(items) > 0 && !k.options.DisableAutoTopicCreation {
+			cancelBatch()
 			return result, fmt.Errorf("Kafka replay requires automatic topic creation to be disabled")
 		}
 		_, producer := k.clients()
-		if err := ensureKafkaTopicExists(producer, plan.destination, k.deliveryTimeout()); err != nil {
-			return result, fmt.Errorf("validate Kafka replay destination for message %q: %w", decoded.ID, err)
+		for index, item := range items {
+			partition := item.sourceMessage.TopicPartition.Partition
+			if transformations[index].Skip {
+				skipDeadLetterReplay(&result, item.plan.destination, request.Execute)
+				if request.Execute {
+					blockedPartitions[partition] = struct{}{}
+				}
+				continue
+			}
+			if !request.Execute {
+				continue
+			}
+			if _, blocked := blockedPartitions[partition]; blocked {
+				retainPlannedDeadLetterReplay(&result, item.plan.destination, true)
+				continue
+			}
+			if _, exists := validatedDestinations[item.plan.destination]; !exists {
+				if err := ensureKafkaTopicExists(producer, item.plan.destination, k.deliveryTimeout()); err != nil {
+					cancelBatch()
+					return result, fmt.Errorf("validate Kafka replay destination for message %q: %w", item.message.ID, err)
+				}
+				validatedDestinations[item.plan.destination] = struct{}{}
+			}
+			if err := k.publishContext(batchCtx, producer, item.plan.destination, transformations[index].Payload, nil); err != nil {
+				cancelBatch()
+				return result, fmt.Errorf("replay Kafka dead-letter message %q: %w", item.message.ID, err)
+			}
+			if _, err := consumer.CommitMessage(item.sourceMessage); err != nil {
+				cancelBatch()
+				return result, fmt.Errorf("commit replayed Kafka dead-letter message %q: %w", item.message.ID, err)
+			}
+			result.Replayed++
 		}
-		if err := k.publishContext(ctx, producer, plan.destination, decoded.Payload, nil); err != nil {
-			return result, fmt.Errorf("replay Kafka dead-letter message %q: %w", decoded.ID, err)
+		cancelBatch()
+		if exhausted || result.Scanned >= request.Limit {
+			break
 		}
-		if _, err := consumer.CommitMessage(message); err != nil {
-			return result, fmt.Errorf("commit replayed Kafka dead-letter message %q: %w", decoded.ID, err)
+		if request.Execute {
+			if err := waitForDeadLetterReplayBatch(ctx, request.BatchDelay); err != nil {
+				return result, err
+			}
 		}
-		result.Replayed++
 	}
 	return result, nil
 }
@@ -151,6 +217,9 @@ func readKafkaDeadLetter(ctx context.Context, consumer KafkaConsumer, idleTimeou
 		}
 		var kafkaError kafka.Error
 		if !errors.As(err, &kafkaError) || kafkaError.Code() != kafka.ErrTimedOut {
+			return nil, false, err
+		}
+		if err := ctx.Err(); err != nil {
 			return nil, false, err
 		}
 		if *assigned {
