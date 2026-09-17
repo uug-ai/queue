@@ -179,6 +179,39 @@ func TestKafkaDeadLetterReplayPublishesBeforeCommit(t *testing.T) {
 	}
 }
 
+func TestKafkaDeadLetterReplayTransformFailureDoesNotPublishOrCommit(t *testing.T) {
+	envelope, err := encodeDeadLetter([]byte("payload"), DeadLetterMetadata{
+		Source:      "events",
+		Destination: "deadletter",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, consumer, producer := newTestKafka(t, &kafka.Message{
+		TopicPartition: kafka.TopicPartition{
+			Topic:     stringPointer("deadletter"),
+			Partition: 1,
+			Offset:    42,
+		},
+		Value: envelope,
+	})
+	client.options.DisableAutoTopicCreation = true
+
+	_, err = client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
+		Limit:   1,
+		Execute: true,
+		Transform: func(context.Context, []DeadLetterMessage) ([][]byte, error) {
+			return nil, errors.New("refresh failed")
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "refresh failed") {
+		t.Fatalf("error = %v", err)
+	}
+	if len(producer.messages) != 0 || consumer.commitCount != 0 {
+		t.Fatalf("messages=%d commits=%d", len(producer.messages), consumer.commitCount)
+	}
+}
+
 func TestKafkaDeadLetterReplayRejectsMissingDestinationBeforePublishOrCommit(t *testing.T) {
 	envelope, err := encodeDeadLetter([]byte("payload"), DeadLetterMetadata{
 		Source:      "missing-events",

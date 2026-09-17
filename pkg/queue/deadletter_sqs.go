@@ -195,6 +195,8 @@ func (s *SQS) releaseSQSDeadLetters(queueURL string, messages []types.Message) e
 		return nil
 	}
 	client, _ := s.clientAndConsumerURL()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	if batchClient, ok := client.(sqsVisibilityBatchClient); ok {
 		for start := 0; start < len(messages); start += int(defaultSQSMaxNumberOfMessages) {
 			end := start + int(defaultSQSMaxNumberOfMessages)
@@ -212,12 +214,10 @@ func (s *SQS) releaseSQSDeadLetters(queueURL string, messages []types.Message) e
 					VisibilityTimeout: 0,
 				})
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), sqsOperationTimeout)
 			output, err := batchClient.ChangeMessageVisibilityBatch(ctx, &awssqs.ChangeMessageVisibilityBatchInput{
 				QueueUrl: aws.String(queueURL),
 				Entries:  entries,
 			})
-			cancel()
 			if err != nil {
 				return fmt.Errorf("release SQS dead-letter message batch: %w", err)
 			}
@@ -234,13 +234,11 @@ func (s *SQS) releaseSQSDeadLetters(queueURL string, messages []types.Message) e
 		if message.ReceiptHandle == nil || *message.ReceiptHandle == "" {
 			return fmt.Errorf("SQS dead-letter message has no receipt handle")
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), sqsOperationTimeout)
 		_, err := client.ChangeMessageVisibility(ctx, &awssqs.ChangeMessageVisibilityInput{
 			QueueUrl:          aws.String(queueURL),
 			ReceiptHandle:     message.ReceiptHandle,
 			VisibilityTimeout: 0,
 		})
-		cancel()
 		if err != nil {
 			return fmt.Errorf("release SQS dead-letter message: %w", err)
 		}

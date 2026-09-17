@@ -257,10 +257,19 @@ func (r *RabbitMQ) publishDeadLetterConfirmed(ctx context.Context, destination s
 
 func (r *RabbitMQ) restoreRabbitDeadLetters(deliveries []amqp.Delivery) error {
 	var result error
-	for _, delivery := range deliveries {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for index, delivery := range deliveries {
+		if err := ctx.Err(); err != nil {
+			result = errors.Join(result, fmt.Errorf("restore retained RabbitMQ dead-letter messages: %w", err))
+			for _, remaining := range deliveries[index:] {
+				if nackErr := remaining.Nack(false, true); nackErr != nil {
+					result = errors.Join(result, fmt.Errorf("requeue retained RabbitMQ dead-letter message: %w", nackErr))
+				}
+			}
+			break
+		}
 		err := r.publishDeadLetterConfirmed(ctx, r.options.DeadletterQueue, delivery.Body)
-		cancel()
 		if err != nil {
 			nackErr := delivery.Nack(false, true)
 			result = errors.Join(result, fmt.Errorf("republish retained RabbitMQ dead-letter message: %w", err))

@@ -121,6 +121,12 @@ in the envelope, and finally the source queue for envelopes written before
 their configured router, which resolves the next queue from the event's
 remaining stages, while non-pipeline workers preserve source-queue behavior.
 
+`DeadLetterReplayRequest.Transform` can replace payloads for an entire planned
+batch before publication. The callback receives decoded messages in replay
+order and must return the same number of payloads. Providers retain the batch
+when transformation fails and continue to publish each transformed payload
+before settling its original dead-letter message.
+
 ## Inspecting and Replaying Dead-Letter Messages
 
 The operational commands are provided by the separate

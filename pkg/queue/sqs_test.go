@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -124,6 +125,36 @@ func TestSQSDeadLetterReplaySendsBeforeDelete(t *testing.T) {
 	}
 	if aws.ToString(fake.sent[0].QueueUrl) != fake.queueURLs["events"] || aws.ToString(fake.sent[0].MessageBody) != "transformed" {
 		t.Fatalf("replay send = %+v", fake.sent[0])
+	}
+}
+
+func TestSQSDeadLetterReplayTransformFailureReleasesBatch(t *testing.T) {
+	envelope, err := encodeDeadLetter([]byte("payload"), DeadLetterMetadata{
+		Source:      "events",
+		Destination: "deadletter",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, fake := newTestSQS(t, types.Message{
+		MessageId:     aws.String("message-1"),
+		Body:          aws.String(string(envelope)),
+		ReceiptHandle: aws.String("receipt"),
+	})
+	fake.visibilityError = nil
+
+	_, err = client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
+		Limit:   1,
+		Execute: true,
+		Transform: func(context.Context, []DeadLetterMessage) ([][]byte, error) {
+			return nil, errors.New("refresh failed")
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "refresh failed") {
+		t.Fatalf("error = %v", err)
+	}
+	if len(fake.sent) != 0 || len(fake.deleted) != 0 || len(fake.visibilityChanges) != 1 {
+		t.Fatalf("sent=%d deleted=%d visibility=%d", len(fake.sent), len(fake.deleted), len(fake.visibilityChanges))
 	}
 }
 

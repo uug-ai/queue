@@ -3,6 +3,7 @@ package queue
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -90,6 +91,64 @@ func TestRabbitDeadLetterReplayPublishesBeforeAck(t *testing.T) {
 	}
 	if !published || result.Replayed != 1 || len(acknowledger.acked) != 1 || len(acknowledger.requeued) != 0 {
 		t.Fatalf("result=%+v acknowledger=%+v", result, acknowledger)
+	}
+}
+
+func TestRabbitDeadLetterReplayTransformFailureRestoresBatch(t *testing.T) {
+	client, err := NewRabbitMQ(NewRabbitOptions().
+		SetConsumerQueue("events").
+		SetDeadletterQueue("deadletter").
+		SetHost("rabbitmq:5672").
+		SetUsername("guest").
+		SetPassword("guest").
+		Build())
+	if err != nil {
+		t.Fatalf("NewRabbitMQ: %v", err)
+	}
+	envelope, err := encodeDeadLetter([]byte("payload"), DeadLetterMetadata{
+		Source:      "events",
+		Destination: "deadletter",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	acknowledger := &fakeRabbitAcknowledger{}
+	deliveries := []amqp.Delivery{{
+		Acknowledger: acknowledger,
+		DeliveryTag:  1,
+		Body:         envelope,
+	}}
+	client.deadLetterGet = func() (amqp.Delivery, bool, error) {
+		if len(deliveries) == 0 {
+			return amqp.Delivery{}, false, nil
+		}
+		delivery := deliveries[0]
+		deliveries = deliveries[1:]
+		return delivery, true, nil
+	}
+	eventPublishes := 0
+	restored := 0
+	client.deadLetterReplayPublish = func(_ context.Context, destination string, _ []byte) error {
+		if destination == "events" {
+			eventPublishes++
+		} else if destination == "deadletter" {
+			restored++
+		}
+		return nil
+	}
+
+	_, err = client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
+		Limit:   1,
+		Execute: true,
+		Transform: func(context.Context, []DeadLetterMessage) ([][]byte, error) {
+			return nil, errors.New("refresh failed")
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "refresh failed") {
+		t.Fatalf("error = %v", err)
+	}
+	if eventPublishes != 0 || restored != 1 || len(acknowledger.acked) != 1 {
+		t.Fatalf("event publishes=%d restored=%d acknowledgements=%v", eventPublishes, restored, acknowledger.acked)
 	}
 }
 
