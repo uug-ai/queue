@@ -17,12 +17,14 @@ func (r *RabbitMQ) PublishDeadLetter(ctx context.Context, payload []byte, metada
 	if err != nil {
 		return err
 	}
-	if r.deadLetterReplayPublish == nil {
-		if err := r.ensureConnected(); err != nil {
-			return err
+	return r.publishAndObserveDeadLetter(r.options.DeadletterQueue, envelope, true, func() error {
+		if r.deadLetterReplayPublish == nil {
+			if err := r.ensureConnected(); err != nil {
+				return err
+			}
 		}
-	}
-	return r.publishDeadLetterConfirmed(ctx, r.options.DeadletterQueue, envelope)
+		return r.publishDeadLetterConfirmed(ctx, r.options.DeadletterQueue, envelope)
+	})
 }
 
 // ReadMessagesToDeadletter transfers raw consumer deliveries into versioned

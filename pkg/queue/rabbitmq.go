@@ -51,6 +51,10 @@ type RabbitOptions struct {
 	// consumer queue forever (see retryOrDeadletter).
 	MaxRetries int
 
+	// DeadLetterObserver receives final DLQ publish outcomes, outside publishing
+	// locks. It must be concurrency-safe, return promptly, and not panic.
+	DeadLetterObserver func(DeadLetterPublishEvent)
+
 	// TLS configuration for secure connections (e.g., AWS Amazon MQ)
 	TLS                   bool   // Enable TLS (auto-enabled when host starts with amqps://)
 	TLSInsecureSkipVerify bool   // Skip TLS certificate verification (development only)
@@ -102,6 +106,12 @@ func (b *RabbitOptionsBuilder) SetWorkflowsStageQueue(queueName string) *RabbitO
 // SetDeadletterQueue sets the deadletter queue name
 func (b *RabbitOptionsBuilder) SetDeadletterQueue(queueName string) *RabbitOptionsBuilder {
 	b.options.DeadletterQueue = queueName
+	return b
+}
+
+// SetDeadLetterObserver sets the optional observer for final DLQ publish outcomes.
+func (b *RabbitOptionsBuilder) SetDeadLetterObserver(observer func(DeadLetterPublishEvent)) *RabbitOptionsBuilder {
+	b.options.DeadLetterObserver = observer
 	return b
 }
 
@@ -1147,17 +1157,11 @@ func (r *RabbitMQ) PublishConfirmed(queueName string, payload []byte) error {
 }
 
 func (r *RabbitMQ) publishLegacyWithReconnect(queueName string, payload []byte, headers amqp.Table) error {
-	if err := r.ensureConnected(); err != nil {
-		return err
-	}
-
-	err := r.publishLegacy(queueName, payload, headers)
-	if err != nil && (r.needsReconnect() || isClosedError(err)) {
-		if reconnectErr := r.Reconnect(); reconnectErr == nil {
-			err = r.publishLegacy(queueName, payload, headers)
-		}
-	}
-	return err
+	return r.publishAndObserveDeadLetter(queueName, payload, false, func() error {
+		return rabbitPublishWithReconnect(r.ensureConnected, func() error {
+			return r.publishLegacy(queueName, payload, headers)
+		}, r.needsReconnect, r.Reconnect)
+	})
 }
 
 func (r *RabbitMQ) publishLegacyWithRecovery(queueName string, payload []byte, headers amqp.Table) error {
@@ -1188,14 +1192,22 @@ func (r *RabbitMQ) publishLegacy(queueName string, payload []byte, headers amqp.
 // closed/stale channel, reconnects once and retries. It is the shared body
 // behind confirmed publishing and confirmed consumer transfers.
 func (r *RabbitMQ) publishConfirmedWithReconnect(queueName string, payload []byte, headers amqp.Table) error {
-	if err := r.ensureConnected(); err != nil {
+	return r.publishAndObserveDeadLetter(queueName, payload, true, func() error {
+		return rabbitPublishWithReconnect(r.ensureConnected, func() error {
+			return r.publishConfirmed(queueName, payload, headers)
+		}, r.needsReconnect, r.Reconnect)
+	})
+}
+
+func rabbitPublishWithReconnect(ensureConnected, publish func() error, needsReconnect func() bool, reconnect func() error) error {
+	if err := ensureConnected(); err != nil {
 		return err
 	}
 
-	err := r.publishConfirmed(queueName, payload, headers)
-	if err != nil && (r.needsReconnect() || isClosedError(err)) {
-		if reconnectErr := r.Reconnect(); reconnectErr == nil {
-			err = r.publishConfirmed(queueName, payload, headers)
+	err := publish()
+	if err != nil && (needsReconnect() || isClosedError(err)) {
+		if reconnectErr := reconnect(); reconnectErr == nil {
+			err = publish()
 		}
 	}
 	return err
@@ -1355,7 +1367,9 @@ func (r *RabbitMQ) addToDeadletter(payload []byte, reason DeadLetterReason, atte
 	if r.deadLetterReplayPublish != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		return r.publishDeadLetterConfirmed(ctx, r.options.DeadletterQueue, envelope)
+		return r.publishAndObserveDeadLetter(r.options.DeadletterQueue, envelope, true, func() error {
+			return r.publishDeadLetterConfirmed(ctx, r.options.DeadletterQueue, envelope)
+		})
 	}
 	if r.options.ConfirmedDelivery {
 		return r.publishConfirmedWithReconnect(r.options.DeadletterQueue, envelope, nil)

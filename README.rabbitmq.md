@@ -64,6 +64,7 @@ methods or channels is required.
 | `PrefetchCount` | No | Maximum unacknowledged deliveries; defaults to `5` |
 | `MaxRetries` | No | Retry limit before dead-lettering; defaults to `10` |
 | `ConfirmedDelivery` | No | Provisions the confirmed producer used by explicit confirmed methods; defaults to `false` |
+| `DeadLetterObserver` | No | Optional `func(DeadLetterPublishEvent)` observing final DLQ publish outcomes |
 | `Exchange` | No | Compatibility field; the default exchange is used |
 | `Uri` | No | Compatibility field; connection uses host and credentials |
 | `TLS` | No | Enables an `amqps://` connection |
@@ -146,6 +147,48 @@ rabbit.SetReturnHandler(func(returned amqp.Return) {
     log.Printf("unroutable queue=%s reason=%s", returned.RoutingKey, returned.ReplyText)
 })
 ```
+
+### Dead-letter publish outcomes
+
+Set `RabbitOptions.DeadLetterObserver` or use `SetDeadLetterObserver` before
+creating the client:
+
+```go
+options := queue.NewRabbitOptions().
+    SetDeadLetterObserver(func(event queue.DeadLetterPublishEvent) {
+        // Send these fields to your application's structured logger or metrics.
+        // Do not treat Err == nil alone as proof of durable delivery.
+    })
+```
+
+The callback runs once per logical publish to the configured DLQ, **after** its
+final result (including reconnect), not when a handler returns `PipelineError`.
+It covers malformed messages, handler errors, failed forwarding, exhausted
+retries, forced `ReadMessagesToDeadletter` transfers, `AddToDeadletter`, direct
+`Publish`/`PublishConfirmed`, delayed DLQ publishes, and `PublishDeadLetter`.
+Inspection, scanning, replay, discard, and restoration of retained messages do
+not emit new-entry events. Validation failures before publishing do not emit.
+
+`Source`, `Reason`, and `Attempts` come from the envelope. `Destination` is the
+actual configured DLQ, not legacy envelope destination metadata that may identify
+a replay queue. `TraceID` and `MediaFileName` are extracted only from the inner
+JSON's `traceId` and `payload.key` (falling back to top-level `fileName`).
+Malformed inner bodies still produce outcomes, with empty correlation fields.
+No payload or arbitrary attributes are exposed, and the observer adds no logger
+or tracing dependency.
+
+`Confirmed` is true only when a broker-confirmed publish succeeds (`Err == nil`).
+An unconfirmed publish can return nil before a mandatory return arrives; its
+event remains `Confirmed: false`. Failed publishes retain their error even if
+subsequent disaster recovery succeeds. Observation precedes source settlement,
+so success does not imply the source acknowledgement succeeded. Redelivery can
+produce another logical publish and event.
+
+Callbacks run synchronously outside publishing locks, including on the delayed
+publisher goroutine. They may run concurrently: handlers must be concurrency-safe,
+return promptly, and not panic. A slow callback delays settlement; avoid recursive
+DLQ publishing from the callback. Do not mutate options after starting the client.
+When unset, no envelope or correlation decoding is performed.
 
 ## TLS
 
