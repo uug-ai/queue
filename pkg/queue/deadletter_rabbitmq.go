@@ -17,6 +17,7 @@ func (r *RabbitMQ) PublishDeadLetter(ctx context.Context, payload []byte, metada
 	if err != nil {
 		return err
 	}
+	r.logDeadLetterRequestFromSource(metadata.Source, metadata.Reason, metadata.Attempts)
 	return r.publishAndObserveDeadLetter(r.options.DeadletterQueue, envelope, true, func() error {
 		if r.deadLetterReplayPublish == nil {
 			if err := r.ensureConnected(); err != nil {

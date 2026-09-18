@@ -77,6 +77,12 @@ testing can enable confirmed delivery and call `ReadMessagesToDeadletter`. The
 method preserves the original body and acknowledges it only after the broker
 confirms the dead-letter envelope.
 
+RabbitMQ can log one structured warning before each new dead-letter publication
+using `RabbitOptions.Logger` / `SetLogger`. The warning records the existing
+terminal reason and available correlation identifiers, without parsing or logging
+payloads. It records a request, not successful delivery.
+See [dead-letter request logging](README.rabbitmq.md#dead-letter-request-logging).
+
 RabbitMQ also offers an optional `RabbitOptions.DeadLetterObserver` callback for
 payload-free final DLQ publish outcomes, including failures and confirmation
 status. See [dead-letter publish outcomes](README.rabbitmq.md#dead-letter-publish-outcomes).

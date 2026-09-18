@@ -65,6 +65,7 @@ methods or channels is required.
 | `MaxRetries` | No | Retry limit before dead-lettering; defaults to `10` |
 | `ConfirmedDelivery` | No | Provisions the confirmed producer used by explicit confirmed methods; defaults to `false` |
 | `DeadLetterObserver` | No | Optional `func(DeadLetterPublishEvent)` observing final DLQ publish outcomes |
+| `Logger` | No | Optional `*logrus.Logger` warning before a new DLQ publication is attempted |
 | `Exchange` | No | Compatibility field; the default exchange is used |
 | `Uri` | No | Compatibility field; connection uses host and credentials |
 | `TLS` | No | Enables an `amqps://` connection |
@@ -147,6 +148,66 @@ rabbit.SetReturnHandler(func(returned amqp.Return) {
     log.Printf("unroutable queue=%s reason=%s", returned.RoutingKey, returned.ReplyText)
 })
 ```
+
+### Dead-letter request logging
+
+Inject your application's logger to log the reason immediately before a logical
+new dead-letter publication is attempted:
+
+```go
+logger := logrus.New()
+logger.SetFormatter(&logrus.JSONFormatter{})
+
+options := queue.NewRabbitOptions().
+    SetConsumerQueue("kcloud-sequence-queue").
+    SetDeadletterQueue("dead-letter-queue").
+    SetHost("rabbitmq.example.com:5672").
+    SetUsername("username").
+    SetPassword("password").
+    SetLogger(logger).
+    Build()
+```
+
+Continue using the normal `ReadMessages` or `ReadMessagesConfirmed` handlers.
+The single WARN uses the shared `models/pkg/api` envelope:
+
+- `applicationStatusCode`: `pipeline_warning`
+- `entityStatusCode`: `dead_letter_requested`
+- `metadata.data`: `sourceQueue`, `deadLetterQueue`, `reason`, `attempts`
+- `metadata.traceId` and `metadata.mediaFileName`: copied only from an already
+  decoded pipeline event, when available. The media identifier prefers
+  `Payload.Key`, falling back to `FileName`.
+
+The existing `DeadLetterReason` catalog supplies the terminal reason:
+
+| Reason | Meaning |
+| --- | --- |
+| `unspecified` | Direct/manual dead-letter request without a more specific reason |
+| `malformed` | Invalid message JSON or an event that cannot be encoded |
+| `handler_error` | The handler returned `PipelineError` |
+| `retry_exhausted` | The retry count reached `MaxRetries` |
+| `publish_failed` | Publishing to the next stage failed |
+
+`attempts` is the retry count for exhaustion and otherwise the value known by the
+publication path (normally zero). Forced transfers may supply their own reason.
+Correlate the terminal request with the consumer's preceding safe error logs for
+the underlying application failure.
+
+This logs a **request, not success or durable delivery**. A publish failure still
+has a request log; reconnect attempts do not emit duplicate request logs.
+Redelivery can create another logical request. Payloads, whole events, signed
+URLs, credentials, and raw exception text are not logged.
+
+Logging does not parse payloads or envelopes. Raw/direct/forced transfers have no
+correlation fields unless the caller already supplied an event through the
+internal pipeline path. Successful forwards, cancellations, and retries below
+the limit do not log a DLQ request. Inspection, scanning, replay, discard, and
+restoration do not count as new requests.
+
+`Logger` is nil by default, with no log construction when disabled. Configure it
+before starting the client. No handler API, payload, headers, settlement behavior,
+or background worker changes are needed. `DeadLetterObserver` below remains a
+separate, optional mechanism; request logging does not enable it.
 
 ### Dead-letter publish outcomes
 

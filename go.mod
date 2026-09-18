@@ -10,6 +10,7 @@ require (
 	github.com/confluentinc/confluent-kafka-go/v2 v2.14.1
 	github.com/go-playground/validator/v10 v10.30.2
 	github.com/rabbitmq/amqp091-go v1.10.0
+	github.com/sirupsen/logrus v1.9.3
 	github.com/uug-ai/models v1.2.26
 )
 
