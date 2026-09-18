@@ -86,11 +86,13 @@ type DeadLetterReplayRequest struct {
 type DeadLetterReplayTransformation struct {
 	Payload []byte
 	Skip    bool
+	Discard bool
 }
 
-// DeadLetterReplayTransformer replaces or skips payloads for a planned replay
+// DeadLetterReplayTransformer replaces, skips, or discards payloads for a planned replay
 // batch. Implementations must return one result for each input message, in the
-// same order. A skipped message remains on the dead-letter destination.
+// same order. A skipped message remains on the dead-letter destination. A
+// discarded message is settled without being published when execution is enabled.
 type DeadLetterReplayTransformer func(context.Context, []DeadLetterMessage) ([]DeadLetterReplayTransformation, error)
 
 type DeadLetterReplayResult struct {
@@ -98,6 +100,8 @@ type DeadLetterReplayResult struct {
 	Matched      int
 	Planned      int
 	Replayed     int
+	DropPlanned  int
+	Dropped      int
 	Retained     int
 	Legacy       int
 	Unroutable   int
@@ -163,9 +167,13 @@ func transformDeadLetterReplayMessages(ctx context.Context, transform DeadLetter
 		return nil, fmt.Errorf("transform dead-letter replay batch returned %d payloads for %d messages", len(transformed), len(messages))
 	}
 	for index := range transformed {
+		if transformed[index].Skip && transformed[index].Discard {
+			return nil, fmt.Errorf("dead-letter replay transformation %d cannot both skip and discard", index)
+		}
 		transformations[index] = DeadLetterReplayTransformation{
 			Payload: append([]byte(nil), transformed[index].Payload...),
 			Skip:    transformed[index].Skip,
+			Discard: transformed[index].Discard,
 		}
 	}
 	return transformations, nil
@@ -388,4 +396,14 @@ func retainPlannedDeadLetterReplay(result *DeadLetterReplayResult, destination s
 	if execute {
 		result.Retained++
 	}
+}
+
+func planDeadLetterDiscard(result *DeadLetterReplayResult, destination string) {
+	result.Planned--
+	if count := result.Destinations[destination]; count <= 1 {
+		delete(result.Destinations, destination)
+	} else {
+		result.Destinations[destination] = count - 1
+	}
+	result.DropPlanned++
 }

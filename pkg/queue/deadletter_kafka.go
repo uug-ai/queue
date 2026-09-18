@@ -140,13 +140,34 @@ func (k *Kafka) ReplayDeadLetters(ctx context.Context, request DeadLetterReplayR
 			cancelBatch()
 			return result, err
 		}
-		if request.Execute && len(items) > 0 && !k.options.DisableAutoTopicCreation {
-			cancelBatch()
-			return result, fmt.Errorf("Kafka replay requires automatic topic creation to be disabled")
+		if request.Execute && !k.options.DisableAutoTopicCreation {
+			for index := range items {
+				if !transformations[index].Skip && !transformations[index].Discard {
+					cancelBatch()
+					return result, fmt.Errorf("Kafka replay requires automatic topic creation to be disabled")
+				}
+			}
 		}
 		_, producer := k.clients()
 		for index, item := range items {
 			partition := item.sourceMessage.TopicPartition.Partition
+			if transformations[index].Discard {
+				if request.Execute {
+					if _, blocked := blockedPartitions[partition]; blocked {
+						retainPlannedDeadLetterReplay(&result, item.plan.destination, true)
+						continue
+					}
+					if _, err := consumer.CommitMessage(item.sourceMessage); err != nil {
+						cancelBatch()
+						return result, fmt.Errorf("commit discarded Kafka dead-letter message %q: %w", item.message.ID, err)
+					}
+				}
+				planDeadLetterDiscard(&result, item.plan.destination)
+				if request.Execute {
+					result.Dropped++
+				}
+				continue
+			}
 			if transformations[index].Skip {
 				skipDeadLetterReplay(&result, item.plan.destination, request.Execute)
 				if request.Execute {

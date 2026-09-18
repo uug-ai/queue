@@ -95,6 +95,59 @@ func TestRabbitDeadLetterReplayPublishesBeforeAck(t *testing.T) {
 	}
 }
 
+func TestRabbitDeadLetterReplayDiscardsWithoutPublishing(t *testing.T) {
+	client, err := NewRabbitMQ(NewRabbitOptions().
+		SetConsumerQueue("events").
+		SetDeadletterQueue("deadletter").
+		SetHost("rabbitmq:5672").
+		SetUsername("guest").
+		SetPassword("guest").
+		Build())
+	if err != nil {
+		t.Fatalf("NewRabbitMQ: %v", err)
+	}
+	envelope, err := encodeDeadLetter([]byte("payload"), DeadLetterMetadata{
+		Source:      "events",
+		Destination: "deadletter",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	acknowledger := &fakeRabbitAcknowledger{}
+	deliveries := []amqp.Delivery{{
+		Acknowledger: acknowledger,
+		DeliveryTag:  1,
+		Body:         envelope,
+	}}
+	client.deadLetterGet = func() (amqp.Delivery, bool, error) {
+		if len(deliveries) == 0 {
+			return amqp.Delivery{}, false, nil
+		}
+		delivery := deliveries[0]
+		deliveries = deliveries[1:]
+		return delivery, true, nil
+	}
+	client.deadLetterReplayPublish = func(context.Context, string, []byte) error {
+		t.Fatal("discard must not publish")
+		return nil
+	}
+
+	result, err := client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
+		Limit:   1,
+		Execute: true,
+		Transform: func(context.Context, []DeadLetterMessage) ([]DeadLetterReplayTransformation, error) {
+			return []DeadLetterReplayTransformation{{Discard: true}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ReplayDeadLetters: %v", err)
+	}
+	if result.Planned != 0 || result.DropPlanned != 1 || result.Dropped != 1 ||
+		result.Replayed != 0 || result.Retained != 0 || len(acknowledger.acked) != 1 {
+		t.Fatalf("result=%+v acknowledger=%+v", result, acknowledger)
+	}
+}
+
 func TestRabbitDeadLetterReplayTransformFailureRestoresBatch(t *testing.T) {
 	client, err := NewRabbitMQ(NewRabbitOptions().
 		SetConsumerQueue("events").
@@ -235,6 +288,42 @@ func TestRabbitDeadLetterReplayBatchesAndRetainsSkippedMessages(t *testing.T) {
 		result.Replayed != 4 || result.Retained != 1 || result.Skipped != 1 ||
 		result.Destinations["events"] != 4 {
 		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestRestoreRabbitDeadLettersStopsPublishingAfterFailure(t *testing.T) {
+	client, err := NewRabbitMQ(NewRabbitOptions().
+		SetConsumerQueue("events").
+		SetDeadletterQueue("deadletter").
+		SetHost("rabbitmq:5672").
+		SetUsername("guest").
+		SetPassword("guest").
+		Build())
+	if err != nil {
+		t.Fatalf("NewRabbitMQ: %v", err)
+	}
+	acknowledger := &fakeRabbitAcknowledger{}
+	deliveries := []amqp.Delivery{
+		{Acknowledger: acknowledger, DeliveryTag: 1, Body: []byte("one")},
+		{Acknowledger: acknowledger, DeliveryTag: 2, Body: []byte("two")},
+		{Acknowledger: acknowledger, DeliveryTag: 3, Body: []byte("three")},
+	}
+	publishes := 0
+	client.deadLetterReplayPublish = func(context.Context, string, []byte) error {
+		publishes++
+		if publishes == 2 {
+			return errors.New("connection closed")
+		}
+		return nil
+	}
+
+	err = client.restoreRabbitDeadLetters(deliveries)
+	if err == nil || !strings.Contains(err.Error(), "connection closed") {
+		t.Fatalf("error = %v", err)
+	}
+	if publishes != 2 || !slices.Equal(acknowledger.acked, []uint64{1}) ||
+		!slices.Equal(acknowledger.requeued, []uint64{2, 3}) {
+		t.Fatalf("publishes=%d acknowledger=%+v", publishes, acknowledger)
 	}
 }
 

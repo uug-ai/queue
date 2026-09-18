@@ -147,6 +147,18 @@ func (s *SQS) ReplayDeadLetters(ctx context.Context, request DeadLetterReplayReq
 			return result, releaseRetained(err)
 		}
 		for index, item := range items {
+			if transformations[index].Discard {
+				planDeadLetterDiscard(&result, item.plan.destination)
+				if request.Execute {
+					if err := s.deleteSQSDeadLetter(batchCtx, deadLetterQueueURL, item.sourceMessage); err != nil {
+						cancelBatch()
+						return result, releaseRetained(fmt.Errorf("discard SQS dead-letter message %q: %w", item.message.ID, err))
+					}
+					retained = removeSQSDeadLetter(retained, aws.ToString(item.sourceMessage.ReceiptHandle))
+					result.Dropped++
+				}
+				continue
+			}
 			if transformations[index].Skip {
 				skipDeadLetterReplay(&result, item.plan.destination, request.Execute)
 				continue
