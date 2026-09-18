@@ -137,6 +137,39 @@ func TestSQSDeadLetterReplaySendsBeforeDelete(t *testing.T) {
 	}
 }
 
+func TestSQSDeadLetterReplayDiscardsWithoutSending(t *testing.T) {
+	envelope, err := encodeDeadLetter([]byte("payload"), DeadLetterMetadata{
+		Source:      "events",
+		Destination: "deadletter",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, fake := newTestSQS(t, types.Message{
+		MessageId:     aws.String("message-1"),
+		Body:          aws.String(string(envelope)),
+		ReceiptHandle: aws.String("receipt"),
+	})
+	fake.deleteError = nil
+	fake.visibilityError = nil
+
+	result, err := client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
+		Limit:   1,
+		Execute: true,
+		Transform: func(context.Context, []DeadLetterMessage) ([]DeadLetterReplayTransformation, error) {
+			return []DeadLetterReplayTransformation{{Discard: true}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ReplayDeadLetters: %v", err)
+	}
+	if result.Planned != 0 || result.DropPlanned != 1 || result.Dropped != 1 ||
+		result.Replayed != 0 || result.Retained != 0 || len(fake.sent) != 0 ||
+		len(fake.deleted) != 1 || len(fake.visibilityChanges) != 0 {
+		t.Fatalf("result=%+v sent=%d deleted=%d visibility=%d", result, len(fake.sent), len(fake.deleted), len(fake.visibilityChanges))
+	}
+}
+
 func TestSQSDeadLetterReplayTransformFailureReleasesBatch(t *testing.T) {
 	envelope, err := encodeDeadLetter([]byte("payload"), DeadLetterMetadata{
 		Source:      "events",

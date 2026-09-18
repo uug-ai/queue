@@ -3,6 +3,7 @@ package queue
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -195,6 +196,15 @@ func TestTransformDeadLetterReplayMessagesRequiresMatchingResultCount(t *testing
 	}, []DeadLetterMessage{{ID: "one"}})
 	if err == nil {
 		t.Fatal("expected transform result count error")
+	}
+}
+
+func TestTransformDeadLetterReplayMessagesRejectsSkipAndDiscard(t *testing.T) {
+	_, err := transformDeadLetterReplayMessages(context.Background(), func(context.Context, []DeadLetterMessage) ([]DeadLetterReplayTransformation, error) {
+		return []DeadLetterReplayTransformation{{Skip: true, Discard: true}}, nil
+	}, []DeadLetterMessage{{ID: "one"}})
+	if err == nil || !strings.Contains(err.Error(), "cannot both skip and discard") {
+		t.Fatalf("error = %v", err)
 	}
 }
 

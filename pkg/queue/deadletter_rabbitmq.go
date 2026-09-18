@@ -170,6 +170,18 @@ func (r *RabbitMQ) ReplayDeadLetters(ctx context.Context, request DeadLetterRepl
 			return result, requeueRetained(err)
 		}
 		for index, item := range items {
+			if transformations[index].Discard {
+				planDeadLetterDiscard(&result, item.plan.destination)
+				if request.Execute {
+					if err := item.delivery.Ack(false); err != nil {
+						cancelBatch()
+						return result, requeueRetained(fmt.Errorf("discard RabbitMQ dead-letter message %q: %w", item.message.ID, err))
+					}
+					retained = removeRabbitDeadLetter(retained, item.delivery.DeliveryTag)
+					result.Dropped++
+				}
+				continue
+			}
 			if transformations[index].Skip {
 				skipDeadLetterReplay(&result, item.plan.destination, request.Execute)
 				continue
@@ -285,11 +297,12 @@ func (r *RabbitMQ) publishDeadLetterConfirmed(ctx context.Context, destination s
 
 func (r *RabbitMQ) restoreRabbitDeadLetters(deliveries []amqp.Delivery) error {
 	var result error
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	for index, delivery := range deliveries {
-		if err := ctx.Err(); err != nil {
-			result = errors.Join(result, fmt.Errorf("restore retained RabbitMQ dead-letter messages: %w", err))
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := r.publishDeadLetterConfirmed(ctx, r.options.DeadletterQueue, delivery.Body)
+		cancel()
+		if err != nil {
+			result = errors.Join(result, fmt.Errorf("republish retained RabbitMQ dead-letter message: %w", err))
 			for _, remaining := range deliveries[index:] {
 				if nackErr := remaining.Nack(false, true); nackErr != nil {
 					result = errors.Join(result, fmt.Errorf("requeue retained RabbitMQ dead-letter message: %w", nackErr))
@@ -297,17 +310,14 @@ func (r *RabbitMQ) restoreRabbitDeadLetters(deliveries []amqp.Delivery) error {
 			}
 			break
 		}
-		err := r.publishDeadLetterConfirmed(ctx, r.options.DeadletterQueue, delivery.Body)
-		if err != nil {
-			result = errors.Join(result, fmt.Errorf("republish retained RabbitMQ dead-letter message: %w", err))
-			nackErr := delivery.Nack(false, true)
-			if nackErr != nil {
-				result = errors.Join(result, fmt.Errorf("requeue retained RabbitMQ dead-letter message: %w", nackErr))
-			}
-			continue
-		}
 		if err := delivery.Ack(false); err != nil {
 			result = errors.Join(result, fmt.Errorf("settle retained RabbitMQ dead-letter message: %w", err))
+			for _, remaining := range deliveries[index:] {
+				if nackErr := remaining.Nack(false, true); nackErr != nil {
+					result = errors.Join(result, fmt.Errorf("requeue retained RabbitMQ dead-letter message: %w", nackErr))
+				}
+			}
+			break
 		}
 	}
 	return result

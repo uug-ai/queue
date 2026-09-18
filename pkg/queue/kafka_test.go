@@ -209,6 +209,42 @@ func TestKafkaDeadLetterReplayPublishesBeforeCommit(t *testing.T) {
 	}
 }
 
+func TestKafkaDeadLetterReplayDiscardsWithoutPublishing(t *testing.T) {
+	envelope, err := encodeDeadLetter([]byte("payload"), DeadLetterMetadata{
+		Source:      "events",
+		Destination: "deadletter",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := &kafka.Message{
+		TopicPartition: kafka.TopicPartition{
+			Topic:     stringPointer("deadletter"),
+			Partition: 1,
+			Offset:    42,
+		},
+		Value: envelope,
+	}
+	client, consumer, producer := newTestKafka(t, message)
+	consumer.commitError = nil
+
+	result, err := client.ReplayDeadLetters(context.Background(), DeadLetterReplayRequest{
+		Limit:   1,
+		Execute: true,
+		Transform: func(context.Context, []DeadLetterMessage) ([]DeadLetterReplayTransformation, error) {
+			return []DeadLetterReplayTransformation{{Discard: true}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("ReplayDeadLetters: %v", err)
+	}
+	if result.Planned != 0 || result.DropPlanned != 1 || result.Dropped != 1 ||
+		result.Replayed != 0 || result.Retained != 0 || consumer.commitCount != 1 ||
+		len(producer.messages) != 0 {
+		t.Fatalf("result=%+v commits=%d messages=%d", result, consumer.commitCount, len(producer.messages))
+	}
+}
+
 func TestKafkaDeadLetterReplayTransformFailureDoesNotPublishOrCommit(t *testing.T) {
 	envelope, err := encodeDeadLetter([]byte("payload"), DeadLetterMetadata{
 		Source:      "events",
