@@ -77,6 +77,10 @@ testing can enable confirmed delivery and call `ReadMessagesToDeadletter`. The
 method preserves the original body and acknowledges it only after the broker
 confirms the dead-letter envelope.
 
+RabbitMQ also offers an optional `RabbitOptions.DeadLetterObserver` callback for
+payload-free final DLQ publish outcomes, including failures and confirmation
+status. See [dead-letter publish outcomes](README.rabbitmq.md#dead-letter-publish-outcomes).
+
 ### Pipeline Actions
 
 Message handlers return a `models.PipelineAction`. The queue client maps that
