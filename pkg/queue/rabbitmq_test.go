@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"os"
@@ -1280,6 +1281,31 @@ func TestTLSConnectionString(t *testing.T) {
 				t.Errorf("expected TLS to be %v, got %v", tt.expectedTLS, rabbit.options.TLS)
 			}
 		})
+	}
+}
+
+func TestBuildTLSConfigRequiresTLS12(t *testing.T) {
+	opts := NewRabbitOptions().
+		SetConsumerQueue("test-queue").
+		SetDeadletterQueue("test-queue-dlq").
+		SetRouterQueue("test-queue-router").
+		SetHost("localhost:5671").
+		SetUsername("user").
+		SetPassword("pass").
+		SetTLS(true).
+		Build()
+
+	rabbit, err := NewRabbitMQ(opts)
+	if err != nil {
+		t.Fatalf("failed to create RabbitMQ instance: %v", err)
+	}
+
+	tlsConfig, err := rabbit.buildTLSConfig()
+	if err != nil {
+		t.Fatalf("failed to build TLS config: %v", err)
+	}
+	if tlsConfig.MinVersion != tls.VersionTLS12 {
+		t.Fatalf("expected minimum TLS version %d, got %d", tls.VersionTLS12, tlsConfig.MinVersion)
 	}
 }
 

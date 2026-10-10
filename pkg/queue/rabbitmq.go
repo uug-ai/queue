@@ -474,6 +474,7 @@ func (r *RabbitMQ) buildTLSConfig() (*tls.Config, error) {
 
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: r.options.TLSInsecureSkipVerify,
+		MinVersion:         tls.VersionTLS12,
 	}
 
 	if r.options.TLSCACertFile == "" {
