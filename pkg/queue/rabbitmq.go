@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +53,17 @@ type RabbitOptions struct {
 	// consumer queue forever (see retryOrDeadletter).
 	MaxRetries int
 
+	// RetryDelays, when set, re-queues a PipelineRetry through delay queues
+	// instead of holding the consumer while it waits. The n-th retry of a
+	// message waits RetryDelays[n-1] (the last delay repeats) in its own delay
+	// queue, which RabbitMQ dead-letters back to the consumer queue once the
+	// delay has passed. The consumer acknowledges the original right away, so a
+	// message that keeps failing no longer blocks the ones it could process in
+	// the meantime. Each delay is a whole number of seconds and gets its own
+	// queue (see retryQueueName), and it replaces the backoff a raw handler
+	// returns. Empty keeps the in-process wait before republishing.
+	RetryDelays []time.Duration
+
 	// DeadLetterObserver receives final DLQ publish outcomes, outside publishing
 	// locks. It must be concurrency-safe, return promptly, and not panic.
 	DeadLetterObserver func(DeadLetterPublishEvent)
@@ -69,7 +81,15 @@ type RabbitOptions struct {
 // Validate validates the RabbitOptions configuration
 func (r *RabbitOptions) Validate() error {
 	validate := validator.New()
-	return validate.Struct(r)
+	if err := validate.Struct(r); err != nil {
+		return err
+	}
+	for _, delay := range r.RetryDelays {
+		if delay < time.Second || delay%time.Second != 0 {
+			return fmt.Errorf("retry delay %s must be a whole number of seconds, at least 1s", delay)
+		}
+	}
+	return nil
 }
 
 // RabbitOptionsBuilder provides a fluent interface for building Rabbit options
@@ -180,6 +200,14 @@ func (b *RabbitOptionsBuilder) SetPrefetchCount(count int) *RabbitOptionsBuilder
 // parked for inspection instead of being requeued forever.
 func (b *RabbitOptionsBuilder) SetMaxRetries(maxRetries int) *RabbitOptionsBuilder {
 	b.options.MaxRetries = maxRetries
+	return b
+}
+
+// SetRetryDelays re-queues retries through delay queues, waiting delays[n-1]
+// before the n-th retry, instead of holding the consumer during the backoff.
+// See RabbitOptions.RetryDelays.
+func (b *RabbitOptionsBuilder) SetRetryDelays(delays ...time.Duration) *RabbitOptionsBuilder {
+	b.options.RetryDelays = delays
 	return b
 }
 
@@ -429,6 +457,11 @@ func (r *RabbitMQ) inspectQueues(consumer *amqp.Channel) error {
 	if _, err := consumer.QueueInspect(r.options.DeadletterQueue); err != nil {
 		return fmt.Errorf("inspect RabbitMQ dead-letter queue %q: %w", r.options.DeadletterQueue, err)
 	}
+	for _, name := range r.retryQueueNames() {
+		if _, err := consumer.QueueInspect(name); err != nil {
+			return fmt.Errorf("inspect RabbitMQ retry queue %q: %w", name, err)
+		}
+	}
 	return nil
 }
 
@@ -464,7 +497,55 @@ func (r *RabbitMQ) declareQueue(consumer *amqp.Channel) error {
 		return err
 	}
 
+	for _, delay := range r.retryDelays() {
+		if _, err := consumer.QueueDeclare(r.retryQueueName(delay), true, false, false, false, retryQueueArguments(r.options.ConsumerQueue, delay)); err != nil {
+			return err
+		}
+	}
+
 	return nil
+}
+
+// retryQueueArguments declares a delay queue: every message expires after
+// delay and is dead-lettered back to consumerQueue through the default
+// exchange. A single TTL per queue keeps expiry in order, since RabbitMQ only
+// expires the message at the head of a queue. At-least-once dead-lettering
+// (which needs reject-publish overflow) keeps a retry from being dropped when
+// the consumer queue cannot take it yet.
+func retryQueueArguments(consumerQueue string, delay time.Duration) amqp.Table {
+	return amqp.Table{
+		"x-queue-type":              "quorum",
+		"x-message-ttl":             int64(delay / time.Millisecond),
+		"x-dead-letter-exchange":    "",
+		"x-dead-letter-routing-key": consumerQueue,
+		"x-dead-letter-strategy":    "at-least-once",
+		"x-overflow":                "reject-publish",
+	}
+}
+
+// retryQueueName names the delay queue for one retry delay, such as
+// "kcloud-notification-queue.retry.5s".
+func (r *RabbitMQ) retryQueueName(delay time.Duration) string {
+	return fmt.Sprintf("%s.retry.%ds", r.options.ConsumerQueue, int64(delay/time.Second))
+}
+
+// retryDelays returns the distinct configured retry delays, in order.
+func (r *RabbitMQ) retryDelays() []time.Duration {
+	var delays []time.Duration
+	for _, delay := range r.options.RetryDelays {
+		if !slices.Contains(delays, delay) {
+			delays = append(delays, delay)
+		}
+	}
+	return delays
+}
+
+func (r *RabbitMQ) retryQueueNames() []string {
+	var names []string
+	for _, delay := range r.retryDelays() {
+		names = append(names, r.retryQueueName(delay))
+	}
+	return names
 }
 
 func (r *RabbitMQ) buildTLSConfig() (*tls.Config, error) {
@@ -1359,11 +1440,13 @@ func retryCount(headers amqp.Table) int {
 	}
 }
 
-// retryOrDeadletter handles a PipelineRetry. It synchronously re-queues the
-// message after a delay, carrying an incremented x-retry-count, until the count
-// reaches the configured cap; past the cap it parks the payload on the
-// deadletter queue instead. The caller acknowledges the original delivery only
-// after this returns nil, so a failed retry publish cannot silently lose it.
+// retryOrDeadletter handles a PipelineRetry. It re-queues the message, carrying
+// an incremented x-retry-count, until the count reaches the configured cap;
+// past the cap it parks the payload on the deadletter queue instead. With
+// RetryDelays it publishes to the delay queue for this retry straight away;
+// otherwise it waits for backoff and then republishes to the consumer queue.
+// The caller acknowledges the original delivery only after this returns nil,
+// so a failed retry publish cannot silently lose it.
 func (r *RabbitMQ) retryOrDeadletter(headers amqp.Table, payload []byte, backoff time.Duration, publish func(string, []byte, amqp.Table) error, events ...*models.PipelineEvent) error {
 	attempts := retryCount(headers)
 	if attempts >= r.maxRetries() {
@@ -1374,15 +1457,17 @@ func (r *RabbitMQ) retryOrDeadletter(headers amqp.Table, payload []byte, backoff
 		r.logDeadLetterRequest(DeadLetterReasonRetryExhausted, attempts, events...)
 		return publish(r.options.DeadletterQueue, envelope, nil)
 	}
+	next := amqp.Table{retryCountHeader: int32(attempts + 1)}
+	if delays := r.options.RetryDelays; len(delays) > 0 {
+		return publish(r.retryQueueName(delays[min(attempts, len(delays)-1)]), payload, next)
+	}
 	if backoff <= 0 {
 		backoff = 5 * time.Second
 	}
 	timer := time.NewTimer(backoff)
 	defer timer.Stop()
 	<-timer.C
-	return publish(r.options.ConsumerQueue, payload, amqp.Table{
-		retryCountHeader: int32(attempts + 1),
-	})
+	return publish(r.options.ConsumerQueue, payload, next)
 }
 
 // AddToDeadletter adds a message to the deadletter queue

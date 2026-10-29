@@ -63,6 +63,7 @@ methods or channels is required.
 | `AnalysisQueue` | No | Optional analysis destination |
 | `PrefetchCount` | No | Maximum unacknowledged deliveries; defaults to `5` |
 | `MaxRetries` | No | Retry limit before dead-lettering; defaults to `10` |
+| `RetryDelays` | No | Delays (whole seconds) for retries through delay queues; empty keeps the in-process wait |
 | `ConfirmedDelivery` | No | Provisions the confirmed producer used by explicit confirmed methods; defaults to `false` |
 | `DeadLetterObserver` | No | Optional `func(DeadLetterPublishEvent)` observing final DLQ publish outcomes |
 | `Logger` | No | Optional `*logrus.Logger` warning before a new DLQ publication is attempted |
@@ -74,7 +75,8 @@ methods or channels is required.
 
 The builder provides matching setters, including `SetConsumerQueue`,
 `SetDeadletterQueue`, `SetRouterQueue`, `SetHost`, `SetUsername`, `SetPassword`,
-`SetPrefetchCount`, `SetMaxRetries`, `SetConfirmedDelivery`, and the TLS setters.
+`SetPrefetchCount`, `SetMaxRetries`, `SetRetryDelays`, `SetConfirmedDelivery`, and
+the TLS setters.
 
 ### Environment Example
 
@@ -282,7 +284,8 @@ requires `SetConfirmedDelivery(true)`.
   when another stage remains.
 - `PipelineError` publishes the handler's event to `DeadletterQueue`.
 - `PipelineRetry` waits for the configured backoff and synchronously republishes
-    to `ConsumerQueue`. The original delivery is acknowledged only after that
+    to `ConsumerQueue`, or, with `RetryDelays`, publishes to the delay queue for
+    this retry without waiting (see Delayed Retries). The original delivery is acknowledged only after that
     publish succeeds; a publish failure returns from the consumer with the
     original delivery unacknowledged so reconnect/redelivery can recover it.
 - `PipelineCancel` only acknowledges the delivery.
@@ -296,6 +299,33 @@ returns the error so a fresh consumer can redeliver it.
 
 RabbitMQ retries carry an `x-retry-count` message header. After `MaxRetries`, the
 payload is parked on `DeadletterQueue` rather than requeued indefinitely.
+
+### Delayed Retries
+
+By default a retry holds the consumer for the backoff before it republishes, so
+a message that keeps failing occupies a prefetch slot for its whole retry cycle
+and the messages behind it wait. With `RetryDelays`, a retry is published to a
+delay queue straight away and the original is acknowledged; the consumer moves
+on to the next message.
+
+```go
+opts := queue.NewRabbitOptions().
+    SetConsumerQueue("kcloud-notification-queue").
+    SetDeadletterQueue("kcloud-notification-deadletter-queue").
+    SetRetryDelays(5*time.Second, 15*time.Second, 30*time.Second, time.Minute).
+    // ...
+    Build()
+```
+
+The n-th retry waits `RetryDelays[n-1]`; the last delay repeats until
+`MaxRetries`. Each distinct delay has its own quorum queue,
+`<ConsumerQueue>.retry.<seconds>s`, with that delay as its message TTL and the
+consumer queue as its at-least-once dead-letter target, so RabbitMQ returns the
+message once the delay has passed. One TTL per queue keeps expiry in order,
+because RabbitMQ only expires the message at the head of a queue. `Connect`
+declares these queues; with `RequireExistingQueues` they must already exist.
+Delays replace the backoff a raw handler returns. The broker must support
+at-least-once dead-lettering for quorum queues (RabbitMQ 3.10 or later).
 
 Processing is at least once. A connection failure after side effects but before
 acknowledgement can cause redelivery.
