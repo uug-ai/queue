@@ -33,14 +33,18 @@ type ReturnHandler func(amqp.Return)
 
 // RabbitOptions holds the configuration for RabbitMQ
 type RabbitOptions struct {
-	ConsumerQueue         string `validate:"required"` // Queue from which to consume messages, one consumer per queue
-	RouterQueue           string // Router queue; only used — and only needs to be set — when a handler returns the Forward action. Stage workers that never forward may leave it unset.
-	DeadletterQueue       string `validate:"required"` // When something goes wrong, messages are sent here
-	AnalysisQueue         string // Queue for analysis messages
-	Uri                   string
-	Host                  string `validate:"required"`
-	Username              string `validate:"required"`
-	Password              string `validate:"required"`
+	ConsumerQueue   string `validate:"required"` // Queue from which to consume messages, one consumer per queue
+	RouterQueue     string // Router queue; only used — and only needs to be set — when a handler returns the Forward action. Stage workers that never forward may leave it unset.
+	DeadletterQueue string `validate:"required"` // When something goes wrong, messages are sent here
+	AnalysisQueue   string // Queue for analysis messages
+	Uri             string
+	Host            string `validate:"required"`
+	Username        string `validate:"required_unless=Anonymous true,excluded_if=Anonymous true"`
+	Password        string `validate:"required_unless=Anonymous true,excluded_if=Anonymous true"`
+	// Anonymous logs in with the SASL ANONYMOUS mechanism instead of a
+	// username and password, which must then be empty. RabbitMQ 4.0 and later
+	// offer it; the broker decides which user an anonymous client acts as.
+	Anonymous             bool
 	PrefetchCount         int
 	Exchange              string
 	ConfirmedDelivery     bool
@@ -182,6 +186,13 @@ func (b *RabbitOptionsBuilder) SetPassword(password string) *RabbitOptionsBuilde
 	return b
 }
 
+// SetAnonymous logs in with SASL ANONYMOUS instead of a username and
+// password. See RabbitOptions.Anonymous.
+func (b *RabbitOptionsBuilder) SetAnonymous(anonymous bool) *RabbitOptionsBuilder {
+	b.options.Anonymous = anonymous
+	return b
+}
+
 // SetExchange sets the exchange
 func (b *RabbitOptionsBuilder) SetExchange(exchange string) *RabbitOptionsBuilder {
 	b.options.Exchange = exchange
@@ -295,16 +306,31 @@ func NewRabbitMQ(options *RabbitOptions) (*RabbitMQ, error) {
 		scheme = "amqps"
 	}
 
-	// Build connection string
+	// Build connection string; an anonymous login carries no user info.
+	connection := &url.URL{Scheme: scheme, Host: host, Path: "/"}
+	if !options.Anonymous {
+		connection.User = url.UserPassword(options.Username, options.Password)
+	}
 	return &RabbitMQ{
-		options: options,
-		connectionString: (&url.URL{
-			Scheme: scheme,
-			User:   url.UserPassword(options.Username, options.Password),
-			Host:   host,
-			Path:   "/",
-		}).String(),
+		options:          options,
+		connectionString: connection.String(),
 	}, nil
+}
+
+// anonymousAuth is the SASL ANONYMOUS mechanism (RFC 4505) with an empty trace.
+type anonymousAuth struct{}
+
+func (anonymousAuth) Mechanism() string { return "ANONYMOUS" }
+func (anonymousAuth) Response() string  { return "" }
+
+// saslMechanisms is nil for a username and password login, so amqp091 uses
+// PLAIN from the connection string. An anonymous login offers ANONYMOUS only:
+// falling back to PLAIN would log in as amqp091's default guest user.
+func (r *RabbitMQ) saslMechanisms() []amqp.Authentication {
+	if r.options.Anonymous {
+		return []amqp.Authentication{anonymousAuth{}}
+	}
+	return nil
 }
 
 // SetDisasterRecoveryHandler sets a custom disaster recovery handler for failed message publishes
@@ -349,6 +375,7 @@ func (r *RabbitMQ) connectLocked() error {
 		Heartbeat:       time.Duration(10) * time.Second, // Set the default heartbeat interval
 		TLSClientConfig: tlsConfig,                       // TLS configuration (nil when TLS is disabled)
 		Vhost:           r.virtualHost(),
+		SASL:            r.saslMechanisms(),
 	})
 	if err != nil {
 		return err
